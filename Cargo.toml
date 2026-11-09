@@ -40,6 +40,8 @@ members = [
     "examples/ai_recipes",
     "examples/speech",
     "crates/shell",
+    "crates/shell-wasm-abi",
+    "crates/shell-wasm-guest",
 ]
 resolver = "2"
 

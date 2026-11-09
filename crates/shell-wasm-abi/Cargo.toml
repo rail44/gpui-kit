@@ -1,0 +1,9 @@
+[package]
+name = "gpui-shell-wasm-abi"
+description = "Spike: the description and import ABI between gpui-shell and a WebAssembly guest view."
+version = "0.9.0"
+edition.workspace = true
+publish = false
+
+[dependencies]
+serde = { workspace = true }

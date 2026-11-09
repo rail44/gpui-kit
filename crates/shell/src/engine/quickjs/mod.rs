@@ -1099,6 +1099,8 @@ pub(super) struct InputCallbackOwner {
 mod standard;
 mod template;
 mod theme_api;
+#[cfg(feature = "wasm-guest")]
+mod wasm_guest;
 mod window_api;
 
 /// The names each built-in module exports.
@@ -2220,6 +2222,18 @@ impl ShellRuntime {
         );
 
         let entry = root.join(entry);
+        // A `.wasm` entry is a WebAssembly guest view; what the module loader
+        // evaluates is the generated view class that hosts it.
+        #[cfg(feature = "wasm-guest")]
+        let source = if entry
+            .extension()
+            .is_some_and(|extension| extension == "wasm")
+        {
+            wasm_guest::load_module(&entry)?
+        } else {
+            read_module_source(&entry)?
+        };
+        #[cfg(not(feature = "wasm-guest"))]
         let source = read_module_source(&entry)?;
 
         // The entry carries the generation too: it is a cached module like any
@@ -7926,6 +7940,8 @@ impl ShellRuntime {
             host_modules::install(ctx)?;
             theme_api::install(ctx, &module)?;
             entity_api::install(ctx, &module, runtime.clone())?;
+            #[cfg(feature = "wasm-guest")]
+            wasm_guest::install(ctx, runtime.clone())?;
             dock_api::install(ctx, &module, runtime.clone())?;
             scheduler::install(ctx, &module)?;
             // Standard Runtime constructors and prototypes must exist before

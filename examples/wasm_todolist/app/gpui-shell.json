@@ -1,0 +1,6 @@
+{
+  "id": "dev.gpui-kit.wasm-todolist",
+  "name": "Wasm Todo",
+  "version": "0.1.0",
+  "entry": "todo.wasm"
+}
