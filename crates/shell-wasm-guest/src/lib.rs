@@ -190,6 +190,17 @@ impl<V: 'static> Cx<V> {
         unsafe { host::close_dialog() }
     }
 
+    /// Opens `part` as a sheet at `placement` (`"left"`, `"right"`, `"top"`
+    /// or `"bottom"`). From a handler only.
+    pub fn open_sheet(&mut self, part: Part, placement: &str) {
+        unsafe { host::open_sheet(part.0, placement.as_ptr() as u32, placement.len() as u32) }
+    }
+
+    /// Closes the open sheet.
+    pub fn close_sheet(&mut self) {
+        unsafe { host::close_sheet() }
+    }
+
     /// Shows a toast, as a script's `window.push_toast`.
     pub fn push_toast(&mut self, title: &str, description: Option<&str>, level: ToastLevel) {
         let level = match level {
@@ -863,6 +874,16 @@ impl Resource {
     pub fn stop(self) {
         unsafe { host::resource_stop(self.0) }
     }
+
+    /// Writes to a streamed process's stdin.
+    pub fn write(self, text: &str) {
+        unsafe { host::process_write(self.0, text.as_ptr() as u32, text.len() as u32) }
+    }
+
+    /// Closes a streamed process's stdin, so it sees the end of its input.
+    pub fn close_stdin(self) {
+        unsafe { host::process_close_stdin(self.0) }
+    }
 }
 
 /// A process whose output arrives as it is written, as a script's
@@ -958,6 +979,10 @@ mod host {
         pub fn input_set_value(handle: u32, ptr: u32, len: u32);
         pub fn input_on_submit(handle: u32, callback: u32);
         pub fn log(ptr: u32, len: u32);
+        pub fn process_write(id: u32, text_ptr: u32, text_len: u32);
+        pub fn process_close_stdin(id: u32);
+        pub fn open_sheet(part: u32, placement_ptr: u32, placement_len: u32);
+        pub fn close_sheet();
         pub fn dock_new(id_ptr: u32, id_len: u32) -> u64;
         pub fn dock_add_panel(
             dock: u64,
@@ -1032,6 +1057,18 @@ mod host {
         unimplemented!("gpui-shell host imports exist only in a wasm32 guest")
     }
     pub unsafe fn log(_: u32, _: u32) {}
+    pub unsafe fn process_write(_: u32, _: u32, _: u32) {
+        unimplemented!("gpui-shell host imports exist only in a wasm32 guest")
+    }
+    pub unsafe fn process_close_stdin(_: u32) {
+        unimplemented!("gpui-shell host imports exist only in a wasm32 guest")
+    }
+    pub unsafe fn open_sheet(_: u32, _: u32, _: u32) {
+        unimplemented!("gpui-shell host imports exist only in a wasm32 guest")
+    }
+    pub unsafe fn close_sheet() {
+        unimplemented!("gpui-shell host imports exist only in a wasm32 guest")
+    }
     pub unsafe fn dock_new(_: u32, _: u32) -> u64 {
         unimplemented!("gpui-shell host imports exist only in a wasm32 guest")
     }

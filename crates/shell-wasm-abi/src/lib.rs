@@ -147,6 +147,16 @@ pub mod import {
     pub const SOCKET_SEND: &str = "socket_send";
     /// `fn(id: u32)`: stops a resource — kills a process, closes a socket.
     pub const RESOURCE_STOP: &str = "resource_stop";
+    /// `fn(id: u32, text_ptr: u32, text_len: u32)`: writes to a streamed
+    /// process's stdin.
+    pub const PROCESS_WRITE: &str = "process_write";
+    /// `fn(id: u32)`: closes a streamed process's stdin.
+    pub const PROCESS_CLOSE_STDIN: &str = "process_close_stdin";
+    /// `fn(part: u32, placement_ptr: u32, placement_len: u32)`: opens a part
+    /// as a sheet at `left`, `right`, `top` or `bottom`, from a handler.
+    pub const OPEN_SHEET: &str = "open_sheet";
+    /// `fn()`: closes the open sheet.
+    pub const CLOSE_SHEET: &str = "close_sheet";
     /// `fn(id_ptr: u32, id_len: u32) -> u64`: creates a dock area (from
     /// `init` or a handler) and returns its handle.
     pub const DOCK_NEW: &str = "dock_new";

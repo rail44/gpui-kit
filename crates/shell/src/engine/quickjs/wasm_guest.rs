@@ -132,14 +132,17 @@ pub(super) fn release(application: &Rc<ApplicationGeneration>) {
 
 /// Something a guest started that runs on its own until stopped.
 enum Resource {
-    Process(crate::process::Killer),
+    Process {
+        killer: crate::process::Killer,
+        stdin: Option<crate::process::StdinWriter>,
+    },
     Socket(std::sync::mpsc::Sender<SocketCommand>),
 }
 
 impl Resource {
     fn stop(self) {
         match self {
-            Resource::Process(killer) => killer.kill(),
+            Resource::Process { killer, .. } => killer.kill(),
             Resource::Socket(commands) => {
                 let _ = commands.send(SocketCommand::Close);
             }
@@ -855,6 +858,30 @@ fn open_pending_dialogs(ctx: &Ctx<'_>, runtime: &Rc<ShellRuntime>, guest: &Guest
         .ok_or_else(|| js_error::type_error(ctx, "adding a panel needs a live host call"))?;
     }
 
+    let sheets = std::mem::take(&mut *guest.pending_sheets.borrow_mut());
+    for (part, placement) in sheets {
+        let placement = match placement.as_str() {
+            "left" => gpui_base::Placement::Left,
+            "right" => gpui_base::Placement::Right,
+            "top" => gpui_base::Placement::Top,
+            "bottom" => gpui_base::Placement::Bottom,
+            other => {
+                return Err(js_error::type_error(
+                    ctx,
+                    &format!("`{other}` is not a sheet placement; use left, right, top or bottom"),
+                ));
+            }
+        };
+        let view = part_view(ctx, runtime, guest, part, None)?;
+        scope::with_current(|window, app| {
+            crate::ShellRoot::update(window, app, |root, window, cx| {
+                root.open_sheet(placement, view.into(), window, cx)
+            })
+        })
+        .flatten()
+        .ok_or_else(|| js_error::type_error(ctx, "open_sheet found no ShellRoot in this window"))?;
+    }
+
     let pending = std::mem::take(&mut *guest.pending_dialogs.borrow_mut());
     for part in pending {
         let view = part_view(ctx, runtime, guest, part, None)?;
@@ -905,6 +932,8 @@ struct Guest {
     pending_dialogs: RefCell<Vec<u32>>,
     /// Panels the guest asked to dock, not yet added.
     pending_panels: RefCell<Vec<PendingPanel>>,
+    /// Parts the guest asked to open as sheets, with their placement.
+    pending_sheets: RefCell<Vec<(u32, String)>>,
     /// Processes and sockets the guest started, by the id it was handed.
     resources: RefCell<Vec<Option<Resource>>>,
 }
@@ -986,6 +1015,7 @@ impl Guest {
             nested: RefCell::new(HashMap::new()),
             pending_dialogs: RefCell::new(Vec::new()),
             pending_panels: RefCell::new(Vec::new()),
+            pending_sheets: RefCell::new(Vec::new()),
             resources: RefCell::new(Vec::new()),
         });
         guest.store.borrow_mut().data_mut().guest = Rc::downgrade(&guest);
@@ -1081,7 +1111,9 @@ impl Guest {
             Err(error) => tracing::error!("wasm guest handler failed: {error:#}"),
         }
         // No script call is running here, so the context is free to open.
-        if (!self.pending_dialogs.borrow().is_empty() || !self.pending_panels.borrow().is_empty())
+        if (!self.pending_dialogs.borrow().is_empty()
+            || !self.pending_panels.borrow().is_empty()
+            || !self.pending_sheets.borrow().is_empty())
             && let Err(error) = runtime.with_js(|ctx| open_pending_dialogs(ctx, &runtime, self))
         {
             tracing::error!("wasm guest dialog failed: {error:#}");
@@ -1446,6 +1478,15 @@ fn run_guest_socket(
                 let _ = events.send_blocking(serde_json::json!({ "close": true }));
                 return;
             }
+            // A binary message reaches the guest as its bytes.
+            Ok(Message::Binary(bytes)) => {
+                if events
+                    .send_blocking(serde_json::json!({ "binary": bytes.to_vec() }))
+                    .is_err()
+                {
+                    return;
+                }
+            }
             Ok(_) => {}
             Err(tungstenite::Error::Io(error))
                 if matches!(
@@ -1705,7 +1746,7 @@ fn link_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 &request.args,
                 crate::process::SpawnOptions {
                     cwd: None,
-                    stdin: false,
+                    stdin: true,
                     timeout: None,
                     lines: true,
                 },
@@ -1716,7 +1757,10 @@ fn link_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 .guest
                 .upgrade()
                 .ok_or_else(|| anyhow!("the guest is gone"))?;
-            let id = guest.add_resource(Resource::Process(spawned.killer.clone()));
+            let id = guest.add_resource(Resource::Process {
+                killer: spawned.killer.clone(),
+                stdin: spawned.stdin,
+            });
             stream_to_guest(Rc::downgrade(&guest), callback, spawned.events, |event| {
                 use crate::process::ProcessEvent;
                 match event {
@@ -1874,6 +1918,77 @@ fn link_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 .ok_or_else(|| anyhow!("the guest is gone"))?;
             guest.pending_dialogs.borrow_mut().push(part);
             Ok(())
+        },
+    )?;
+    linker.func_wrap(
+        module,
+        abi::import::PROCESS_WRITE,
+        |mut caller: Caller<'_, HostState>, id: u32, text_ptr: u32, text_len: u32| -> Result<()> {
+            let text = read_string(&mut caller, text_ptr, text_len)?;
+            let guest = caller
+                .data()
+                .guest
+                .upgrade()
+                .ok_or_else(|| anyhow!("the guest is gone"))?;
+            let mut resources = guest.resources.borrow_mut();
+            match resources.get_mut(id as usize) {
+                Some(Some(Resource::Process {
+                    stdin: Some(stdin), ..
+                })) => stdin.write(text).map_err(|error| anyhow!(error)),
+                _ => Err(anyhow!("process {id} has no open stdin")),
+            }
+        },
+    )?;
+    linker.func_wrap(
+        module,
+        abi::import::PROCESS_CLOSE_STDIN,
+        |caller: Caller<'_, HostState>, id: u32| -> Result<()> {
+            let guest = caller
+                .data()
+                .guest
+                .upgrade()
+                .ok_or_else(|| anyhow!("the guest is gone"))?;
+            if let Some(Some(Resource::Process { stdin, .. })) =
+                guest.resources.borrow_mut().get_mut(id as usize)
+                && let Some(mut stdin) = stdin.take()
+            {
+                stdin.end();
+            }
+            Ok(())
+        },
+    )?;
+    linker.func_wrap(
+        module,
+        abi::import::OPEN_SHEET,
+        |mut caller: Caller<'_, HostState>,
+         part: u32,
+         placement_ptr: u32,
+         placement_len: u32|
+         -> Result<()> {
+            ensure_overlay_phase("open_sheet")?;
+            let placement = read_string(&mut caller, placement_ptr, placement_len)?;
+            let guest = caller
+                .data()
+                .guest
+                .upgrade()
+                .ok_or_else(|| anyhow!("the guest is gone"))?;
+            guest.pending_sheets.borrow_mut().push((part, placement));
+            Ok(())
+        },
+    )?;
+    linker.func_wrap(
+        module,
+        abi::import::CLOSE_SHEET,
+        |_caller: Caller<'_, HostState>| -> Result<()> {
+            ensure_overlay_phase("close_sheet")?;
+            scope::with_current(|window, app| {
+                crate::ShellRoot::update(window, app, |root, window, cx| {
+                    root.close_sheet(window, cx)
+                })
+            })
+            .flatten()
+            .map(|_| ())
+            .ok_or_else(|| anyhow!("close_sheet found no ShellRoot in this window"))
         },
     )?;
     linker.func_wrap(
@@ -2655,6 +2770,21 @@ mod tests {
         assert_eq!(toasts, 1);
         let tree = app.tree();
         assert!(tree.contains("Total: 0"), "{tree}");
+
+        // A part opened as a sheet from the window's edge, which its own
+        // handler closes.
+        app.click("details");
+        let sheet_open = app.context.update(|_, cx| root.read(cx).sheet().is_some());
+        assert!(sheet_open);
+        app.settle();
+        let details = part_views(&mut app.context, &app.view)
+            .into_iter()
+            .find(|view| app.tree_of(view).contains("Details: 0"))
+            .expect("the sheet's view");
+        let close = app.handler_in(&details, "close-details", "on_click");
+        app.dispatch_click(close);
+        let sheet_open = app.context.update(|_, cx| root.read(cx).sheet().is_some());
+        assert!(!sheet_open);
     }
 
     #[gpui::test]
@@ -3039,6 +3169,9 @@ mod tests {
                                 text.as_str()
                             )))
                             .unwrap();
+                        socket
+                            .send(tungstenite::Message::binary(vec![1u8, 2, 3]))
+                            .unwrap();
                     }
                     Ok(_) => {}
                     Err(_) => break,
@@ -3064,7 +3197,10 @@ mod tests {
             crate::Capabilities::new()
                 .storage(true)
                 .network_hosts(["127.0.0.1".to_owned()])
-                .execute(crate::ExecuteGrant::Allowed(vec!["seq".to_owned()])),
+                .execute(crate::ExecuteGrant::Allowed(vec![
+                    "seq".to_owned(),
+                    "cat".to_owned(),
+                ])),
         );
         let runtime = ShellRuntime::new_isolated().expect("runtime");
         cx.update(|cx| runtime.set_global(cx));
@@ -3083,7 +3219,10 @@ mod tests {
                 .advance_clock(std::time::Duration::from_millis(20));
             context.run_until_parked();
             tree = drawn_tree(&mut context, &view);
-            if tree.contains("Exit: 0") && tree.contains("Closed: true") {
+            if tree.contains("Exit: 0")
+                && tree.contains("Closed: true")
+                && tree.contains("Piped: piped")
+            {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
@@ -3091,9 +3230,12 @@ mod tests {
         // One handler call per line, then one for the exit.
         assert!(tree.contains("Lines: 1,2,3"), "{tree}");
         assert!(tree.contains("Exit: 0"), "{tree}");
-        // The greeting, the echo of the guest's reply, then the close the
-        // guest asked for.
+        // What the guest wrote to `cat`'s stdin came back on its stdout.
+        assert!(tree.contains("Piped: piped through stdin"), "{tree}");
+        // The greeting, the echo of the guest's reply, the binary message,
+        // then the close the guest asked for.
         assert!(tree.contains("Messages: hello,echo ping"), "{tree}");
+        assert!(tree.contains("Binary: 1,2,3"), "{tree}");
         assert!(tree.contains("Closed: true"), "{tree}");
     }
 

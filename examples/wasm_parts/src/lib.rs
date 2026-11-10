@@ -1,7 +1,8 @@
 //! A guest whose view is split into parts: a counter drawn in place as a
 //! child view of its own, a confirmation shown as a dialog over the window,
 //! and toasts — what a script does with a nested view, `window.open_dialog`
-//! and `window.push_toast`. Every part reads the same guest state, and a
+//! and `window.push_toast`, plus a details sheet sliding in from the right
+//! edge, as `window.open_sheet`. Every part reads the same guest state, and a
 //! notify from any of them re-renders all of them.
 
 use gpui_shell_wasm_guest::prelude::*;
@@ -10,6 +11,7 @@ struct Parts {
     count: u32,
     counter: Part,
     confirm: Part,
+    details: Part,
 }
 
 impl View for Parts {
@@ -46,15 +48,28 @@ impl View for Parts {
                         },
                     )))
             });
+        let details = cx.part(|this: &mut Parts, cx| {
+            v_flex()
+                .gap(8.)
+                .p(16.)
+                .child(text(format!("Details: {}", this.count)))
+                .child(
+                    button("close-details")
+                        .child(text("Close"))
+                        .on_click(cx.listener(|_, _, cx| cx.close_sheet())),
+                )
+        });
         Parts {
             count: 0,
             counter,
             confirm,
+            details,
         }
     }
 
     fn render(&mut self, cx: &mut Cx<Self>) -> Element {
         let confirm = self.confirm;
+        let details = self.details;
         v_flex()
             .gap(8.)
             .child(text(format!("Total: {}", self.count)))
@@ -63,6 +78,11 @@ impl View for Parts {
                 button("open")
                     .child(text("Reset…"))
                     .on_click(cx.listener(move |_, _, cx| cx.open_dialog(confirm))),
+            )
+            .child(
+                button("details")
+                    .child(text("Details"))
+                    .on_click(cx.listener(move |_, _, cx| cx.open_sheet(details, "right"))),
             )
     }
 }
