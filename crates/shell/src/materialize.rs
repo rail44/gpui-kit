@@ -1457,6 +1457,10 @@ fn materialize_component(
             image.style().refine(&refinement);
             image.into_any_element()
         }
+        Component::Canvas(spec) => {
+            warn_unhonoured_a11y(&behavior, "canvas", &[]);
+            crate::canvas::CanvasElement::new(spec, refinement).into_any_element()
+        }
         Component::Path {
             fill,
             background,

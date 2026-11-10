@@ -34,10 +34,11 @@ pub use gpui_shell_wasm_abi as abi;
 use serde_json::Value;
 
 pub mod prelude {
+    pub use crate::abi::PaintOp;
     pub use crate::{
         CArg, ComponentState, Cx, Data, Dock, Element, Event, Handler, InputState, Part,
-        ToastLevel, View, button, checkbox, component, div, dock, export_view, h_flex, input,
-        nested, text, v_flex,
+        ToastLevel, View, button, canvas, checkbox, component, div, dock, export_view, h_flex,
+        input, mono_font, nested, text, text_advance, v_flex,
     };
 }
 
@@ -256,6 +257,26 @@ impl Dock {
     pub fn load(&self, layout: &str) {
         unsafe { host::dock_load(self.0, layout.as_ptr() as u32, layout.len() as u32) }
     }
+}
+
+/// A box the guest paints itself with `ops`, in `font`: a script's
+/// `canvas`. Size it with styles (`size_full`, `w`, `h`, ...).
+pub fn canvas(font: &str, ops: Vec<abi::PaintOp>) -> Element {
+    element(Component::Canvas {
+        font: font.to_owned(),
+        ops,
+    })
+}
+
+/// The advance of one character of `font` at `size` pixels: the cell width of
+/// a monospaced grid painted on a [`canvas`].
+pub fn text_advance(font: &str, size: f32) -> f32 {
+    unsafe { host::text_advance(font.as_ptr() as u32, font.len() as u32, size) }
+}
+
+/// The theme's monospace family, resolved to a font this machine has.
+pub fn mono_font() -> String {
+    take_string(unsafe { host::mono_font() })
 }
 
 /// Draws a dock area.
@@ -997,6 +1018,8 @@ mod host {
         pub fn close_sheet();
         pub fn dock_new(id_ptr: u32, id_len: u32) -> u64;
         pub fn dock_dump(dock: u64) -> u64;
+        pub fn text_advance(font_ptr: u32, font_len: u32, size: f32) -> f32;
+        pub fn mono_font() -> u64;
         pub fn dock_load(dock: u64, layout_ptr: u32, layout_len: u32);
         pub fn dock_add_panel(
             dock: u64,
@@ -1082,6 +1105,12 @@ mod host {
     }
     pub unsafe fn close_sheet() {
         unimplemented!("gpui-shell host imports exist only in a wasm32 guest")
+    }
+    pub unsafe fn mono_font() -> u64 {
+        unreachable!()
+    }
+    pub unsafe fn text_advance(_: u32, _: u32, _: f32) -> f32 {
+        unreachable!()
     }
     pub unsafe fn dock_dump(_: u64) -> u64 {
         unreachable!()
