@@ -328,10 +328,6 @@ pub(crate) enum Component {
     AvatarFallback,
     /// A full-color image, loaded from the application's own directory.
     Image(String),
-    /// A box its application paints itself. Only the WebAssembly engine
-    /// records one; see `crate::canvas`.
-    #[cfg_attr(not(feature = "wasm-engine"), allow(dead_code))]
-    Canvas(Rc<crate::canvas::CanvasSpec>),
     /// A native GPUI path. Its geometry is retained in method operations and
     /// resolved against final element bounds during prepaint.
     Path {
@@ -717,7 +713,6 @@ impl Component {
             Component::Avatar => "Avatar",
             Component::AvatarImage(_) => "AvatarImage",
             Component::AvatarFallback => "AvatarFallback",
-            Component::Canvas(_) => "canvas",
             Component::Path { fill: true, .. } => "path fill",
             Component::Path { fill: false, .. } => "path stroke",
             Component::Tabs(_) => "Tabs",

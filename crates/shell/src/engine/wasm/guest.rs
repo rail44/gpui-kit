@@ -140,9 +140,6 @@ pub(super) fn record_nodes(
                 ))
             }
             abi::Component::Nested(part) => nested_view(runtime, guest, *part)?,
-            abi::Component::Canvas { font, ops } => runtime
-                .arena_mut()
-                .push(Component::Canvas(Rc::new(canvas_spec(font, ops)?))),
             abi::Component::Dock(handle) => runtime
                 .arena_mut()
                 .push_dock_area(EntityHandle::from(*handle))
@@ -268,58 +265,6 @@ pub(super) fn record_nodes(
     }
 
     Ok(ids)
-}
-
-/// A canvas's operations with their colors resolved, as a style's are: a
-/// theme token or a `#rrggbb[aa]` literal.
-fn canvas_spec(font: &str, ops: &[abi::PaintOp]) -> Result<crate::canvas::CanvasSpec> {
-    use crate::canvas::CanvasOp;
-    use gpui::{Bounds, point, px, size};
-    let color = |value: &str| -> Result<gpui::Hsla> {
-        if value.starts_with('#') {
-            Bridged::Str(value.to_owned())
-                .as_color()
-                .map_err(|error| anyhow!("{error}"))
-        } else {
-            crate::theme_tokens::token_color(value)
-                .ok_or_else(|| anyhow!("unknown color token `{value}`"))
-        }
-    };
-    let ops = ops
-        .iter()
-        .map(|op| {
-            Ok(match op {
-                abi::PaintOp::Rect {
-                    x,
-                    y,
-                    width,
-                    height,
-                    color: value,
-                } => CanvasOp::Rect {
-                    bounds: Bounds::new(point(px(*x), px(*y)), size(px(*width), px(*height))),
-                    color: color(value)?,
-                },
-                abi::PaintOp::Text {
-                    x,
-                    y,
-                    text,
-                    color: value,
-                    size: font_size,
-                    line_height,
-                } => CanvasOp::Text {
-                    origin: point(px(*x), px(*y)),
-                    text: text.clone().into(),
-                    color: color(value)?,
-                    size: px(*font_size),
-                    line_height: px(*line_height),
-                },
-            })
-        })
-        .collect::<Result<_>>()?;
-    Ok(crate::canvas::CanvasSpec {
-        font: font.to_owned().into(),
-        ops,
-    })
 }
 
 /// The element slots a component takes, by the names the script API uses.
@@ -544,7 +489,6 @@ fn component(component: &abi::Component) -> Component {
         abi::Component::Registered { .. }
         | abi::Component::Nested(_)
         | abi::Component::Dock(_)
-        | abi::Component::Canvas { .. }
         | abi::Component::List { .. } => unreachable!("recorded by `record_nodes`"),
     }
 }
@@ -1860,35 +1804,6 @@ fn link_imports(linker: &mut Linker<HostState>) -> Result<()> {
     )?;
     linker.func_wrap(
         module,
-        abi::import::MONO_FONT,
-        |mut caller: Caller<'_, HostState>| -> Result<u64> {
-            use gpui_component::ActiveTheme as _;
-            let family = scope::with_current_app(|cx| cx.theme().mono_font_family.to_string())
-                .ok_or_else(|| anyhow!("mono_font needs a live host call"))?;
-            write_string(&mut caller, &family)
-        },
-    )?;
-    linker.func_wrap(
-        module,
-        abi::import::TEXT_ADVANCE,
-        |mut caller: Caller<'_, HostState>,
-         font_ptr: u32,
-         font_len: u32,
-         size: f32|
-         -> Result<f32> {
-            let family = read_string(&mut caller, font_ptr, font_len)?;
-            scope::with_current_app(|cx| {
-                let text_system = cx.text_system();
-                let font = text_system.resolve_font(&gpui::font(family));
-                text_system
-                    .advance(font, gpui::px(size), 'm')
-                    .map(|advance| f32::from(advance.width))
-            })
-            .ok_or_else(|| anyhow!("text_advance needs a live host call"))?
-        },
-    )?;
-    linker.func_wrap(
-        module,
         abi::import::DOCK_DUMP,
         |mut caller: Caller<'_, HostState>, dock: u64| -> Result<u64> {
             let runtime = runtime_of(&caller)?;
@@ -2870,192 +2785,6 @@ mod tests {
             runtime.build_snapshot(&object, None, crate::policy::default(), window, cx)
         })?;
         Ok(snapshot.debug_tree())
-    }
-
-    /// The `on_click` of the button with element id `id` in `view`'s
-    /// published description.
-    fn button_in(
-        context: &mut VisualTestContext,
-        view: &Entity<ScriptView>,
-        id: &str,
-    ) -> crate::spec::CallbackId {
-        let view = view.clone();
-        let id = id.to_owned();
-        context.update(|_, cx| {
-            let view = view.read(cx);
-            let snapshot = view.snapshot().expect("a published snapshot");
-            let arena = snapshot.arena();
-            (0..arena.len())
-                .filter_map(|node| arena.node(node as SpecId))
-                .find_map(|node| match node.component()? {
-                    Component::Button(button) if *button == id => {
-                        node.ops().iter().find_map(|op| match op {
-                            SpecOp::Callback("on_click", callback) => Some(*callback),
-                            _ => None,
-                        })
-                    }
-                    _ => None,
-                })
-                .unwrap_or_else(|| panic!("no button `{id}`"))
-        })
-    }
-
-    /// One frame of `view`, as the window would draw it: render (if the
-    /// view is invalidated), materialize, layout, prepaint and paint.
-    fn frame(context: &mut VisualTestContext, view: &Entity<ScriptView>) {
-        let view = view.clone();
-        context.draw(
-            gpui::Point::default(),
-            gpui::size(gpui::px(1800.), gpui::px(1300.)),
-            move |_, _| view.into_any_element(),
-        );
-    }
-
-    /// A terminal-like grid drawn by a guest, timed per update with GPUI's
-    /// real text system (Linux shapes text without a window), as elements
-    /// and as canvas paint operations, at two sizes, for output that scrolls
-    /// for a screen that changes everywhere, and for one whose every cell has
-    /// a color of its own (the worst case). An update is the guest's
-    /// handler, then one frame. GPU rasterization is not part of it: the test
-    /// window records the scene and draws nothing. Meaningful only in a
-    /// release build:
-    ///
-    /// ```text
-    /// cargo test -p gpui-shell --release --no-default-features \
-    ///     --features wasm-engine --lib terminal_grid -- --nocapture
-    /// ```
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn the_terminal_grid_is_timed_per_update_with_real_shaping() {
-        let mut cx = TestAppContext::build_with_text_system(
-            gpui::TestDispatcher::new(0),
-            None,
-            gpui_platform::current_platform(true).text_system(),
-        );
-        let directory = application("wasm_terminal");
-        let components = crate::components::components().expect("catalog");
-        cx.update(|cx| crate::init_with_components(cx, &components));
-        let runtime = ShellRuntime::new_isolated_with_components(components).expect("runtime");
-        cx.update(|cx| runtime.set_global(cx));
-        let window = cx.add_window(|_, _| gpui::Empty);
-        let mut context = VisualTestContext::from_window(*window.deref(), &mut cx);
-        let view_type = runtime.load_app(&directory, "guest.wasm").expect("load");
-        let view = context
-            .update(|window, cx| runtime.instantiate_view(&view_type, window, cx))
-            .expect("instantiate");
-        frame(&mut context, &view);
-
-        // A debug build checks that every case runs; only a release build's
-        // figures mean anything, and only it fills the screen first.
-        let (fill, warmup, updates) = if cfg!(debug_assertions) {
-            (1, 0, 1)
-        } else {
-            (60, 10, 60)
-        };
-        let click = |context: &mut VisualTestContext, id: &str| {
-            let callback = button_in(context, &view, id);
-            let runtime = runtime.clone();
-            context.update(|window, cx| {
-                runtime.dispatch_click(callback, &ClickEvent::default(), window, cx)
-            });
-            frame(context, &view);
-        };
-        let ms = |duration: std::time::Duration| duration.as_secs_f64() * 1000.0;
-        let median = |mut samples: Vec<std::time::Duration>| {
-            samples.sort();
-            samples[samples.len() / 2]
-        };
-
-        for size in ["size-80x24", "size-200x60"] {
-            for pattern in ["pattern-scroll", "pattern-redraw", "pattern-cells"] {
-                for mode in ["mode-elements", "mode-canvas"] {
-                    click(&mut context, size);
-                    click(&mut context, pattern);
-                    click(&mut context, mode);
-                    // A full screen before timing starts.
-                    for _ in 0..fill {
-                        click(&mut context, "step");
-                    }
-                    for _ in 0..warmup {
-                        click(&mut context, "step");
-                    }
-                    let (mut totals, mut describes, mut materializes) =
-                        (Vec::new(), Vec::new(), Vec::new());
-                    for _ in 0..updates {
-                        let step = button_in(&mut context, &view, "step");
-                        let before = runtime.read_metrics();
-                        let started = std::time::Instant::now();
-                        {
-                            let runtime = runtime.clone();
-                            context.update(|window, cx| {
-                                runtime.dispatch_click(step, &ClickEvent::default(), window, cx)
-                            });
-                        }
-                        frame(&mut context, &view);
-                        totals.push(started.elapsed());
-                        let spent = runtime.read_metrics().since(&before);
-                        describes.push(spent.script_render_time());
-                        materializes.push(spent.materialize_time());
-                    }
-                    let nodes = context.update(|_, cx| {
-                        view.read(cx)
-                            .snapshot()
-                            .map(RenderSnapshot::len)
-                            .unwrap_or(0)
-                    });
-                    let (total, describe, materialize) =
-                        (median(totals), median(describes), median(materializes));
-                    println!(
-                        "[terminal] {} {} {} nodes={nodes} describe={:.3} materialize={:.3} \
-                         layout+paint+handler={:.3} total={:.3} (ms, median of {updates})",
-                        &size[5..],
-                        &pattern[8..],
-                        &mode[5..],
-                        ms(describe),
-                        ms(materialize),
-                        ms(total.saturating_sub(describe + materialize)),
-                        ms(total),
-                    );
-                }
-            }
-        }
-    }
-
-    /// A command's output reaches the grid line by line through the process
-    /// stream, escape sequences dropped.
-    #[gpui::test]
-    fn the_terminal_guest_streams_a_command_into_its_grid(cx: &mut TestAppContext) {
-        crate::set_capabilities(
-            crate::Capabilities::new()
-                .execute(crate::ExecuteGrant::Allowed(vec!["seq".to_owned()])),
-        );
-        let mut app = Harness::load_example(cx, "wasm_terminal");
-        app.type_text("seq 1 50");
-        let input = app.input();
-        app.context.update(|_, cx| {
-            input.update(cx, |_, cx| {
-                cx.emit(InputEvent::PressEnter {
-                    secondary: false,
-                    shift: false,
-                })
-            })
-        });
-        let mut tree = String::new();
-        for _ in 0..300 {
-            app.context
-                .executor()
-                .advance_clock(std::time::Duration::from_millis(20));
-            app.settle();
-            tree = app.tree();
-            if tree.contains("[exit") {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        // The prompt line, 50 numbers and the exit line; the last 24 shown.
-        assert!(tree.contains("52 lines"), "{tree}");
-        assert!(tree.contains("\"50\""), "{tree}");
-        assert!(tree.contains("[exit"), "{tree}");
     }
 
     /// What the shipped command's `check` does: load through the manifest,

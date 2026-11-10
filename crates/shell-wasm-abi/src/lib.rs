@@ -171,14 +171,6 @@ pub mod import {
     /// `DOCK_DUMP` wrote, rebuilding each panel from the part docked under
     /// its name. Panels must be added (under the same names) first.
     pub const DOCK_LOAD: &str = "dock_load";
-    /// `fn(font_ptr: u32, font_len: u32, size: f32) -> f32`: the advance of
-    /// one character of `font` at `size` pixels, so a guest painting a
-    /// monospaced grid on a canvas can place its cells.
-    pub const TEXT_ADVANCE: &str = "text_advance";
-    /// `fn() -> u64`: the monospace family the theme resolved to an
-    /// installed font. A family that is not installed cannot be laid out, so
-    /// a guest asks rather than naming one.
-    pub const MONO_FONT: &str = "mono_font";
     /// `fn(toast_ptr: u32, toast_len: u32)`: shows a toast described as JSON
     /// `{"title", "description", "level"}`.
     pub const PUSH_TOAST: &str = "push_toast";
@@ -262,38 +254,6 @@ pub enum Component {
     Registered {
         export: String,
         args: Vec<ComponentArg>,
-    },
-    /// A box the guest paints itself: rectangles and runs of text in
-    /// `font`, in pixels from the box's top-left, in order. The box is sized
-    /// by its styles like any element. For a surface (a terminal grid, a
-    /// chart) whose content is positioned by the guest rather than laid out.
-    Canvas {
-        font: String,
-        ops: Vec<PaintOp>,
-    },
-}
-
-/// One drawing operation of a [`Component::Canvas`]. A color is a theme
-/// token or a `#rrggbb[aa]` literal, as a style's is.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub enum PaintOp {
-    /// Fills a rectangle.
-    Rect {
-        x: f32,
-        y: f32,
-        width: f32,
-        height: f32,
-        color: String,
-    },
-    /// Draws one run of text with its top-left at `(x, y)`, `line_height`
-    /// tall, at `size` pixels.
-    Text {
-        x: f32,
-        y: f32,
-        text: String,
-        color: String,
-        size: f32,
-        line_height: f32,
     },
 }
 
