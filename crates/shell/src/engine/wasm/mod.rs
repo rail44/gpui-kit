@@ -105,11 +105,31 @@ impl ViewObject {
     }
 }
 
-/// A guest handler in the callback arena: which guest, and its number there.
+/// A guest handler in the callback arena: which guest, and what it calls.
 #[derive(Clone)]
 pub(crate) struct GuestHandler {
     guest: Weak<Guest>,
-    handler: u32,
+    target: HandlerTarget,
+}
+
+/// What a callback reaches in its guest.
+#[derive(Clone)]
+pub(crate) enum HandlerTarget {
+    /// A description guest's handler, or an import's callback id.
+    Callback(u32),
+    /// A retained guest's node's handler for an event.
+    Node(u64, &'static str),
+}
+
+impl GuestHandler {
+    /// The number of a description guest's handler (a list's renderer or
+    /// key function).
+    fn callback(&self) -> Option<u32> {
+        match self.target {
+            HandlerTarget::Callback(handler) => Some(handler),
+            HandlerTarget::Node(..) => None,
+        }
+    }
 }
 
 /// The App can find its default runtime without becoming its owner.
@@ -584,7 +604,7 @@ impl ShellRuntime {
             Some(parent) => ScriptView::nested(runtime, object, policy, parent),
             None => ScriptView::with_policy(runtime, object, policy),
         });
-        guest.add_view(&view);
+        guest.add_view(&view, part);
         view
     }
 
@@ -616,10 +636,7 @@ impl ShellRuntime {
                 policy,
                 application.clone(),
             );
-            object
-                .guest
-                .render(object.part)
-                .and_then(|description| guest::record(self, &object.guest, &description))
+            guest::describe(self, &object.guest, object.part)
         });
         let root = match root {
             Ok(root) => root,
@@ -685,7 +702,22 @@ impl ShellRuntime {
         self.callbacks.borrow_mut().push(CallbackEntry {
             value: GuestHandler {
                 guest: Rc::downgrade(guest),
-                handler,
+                target: HandlerTarget::Callback(handler),
+            },
+            view: scope::current_view().map(|view| view.downgrade()),
+            application: scope::current_application_generation(),
+            registered_in: scope::current_generation(),
+        })
+    }
+
+    /// Puts a retained guest's node handler into the open callback
+    /// generation: the number is the node's, so it holds for the node's life
+    /// while the callback id is per snapshot.
+    fn register_node(&self, guest: &Rc<Guest>, node: u64, event: &'static str) -> CallbackId {
+        self.callbacks.borrow_mut().push(CallbackEntry {
+            value: GuestHandler {
+                guest: Rc::downgrade(guest),
+                target: HandlerTarget::Node(node, event),
             },
             view: scope::current_view().map(|view| view.downgrade()),
             application: scope::current_application_generation(),
@@ -740,7 +772,7 @@ impl ShellRuntime {
             policy,
             entry.application.clone(),
         );
-        guest::handle(self, &guest, entry.value.handler, &payload)
+        guest::handle(self, &guest, &entry.value.target, &payload)
     }
 
     /// [`Self::run_handler`] for an event whose failure has nobody to report
@@ -808,7 +840,11 @@ impl ShellRuntime {
         let outer = std::mem::take(&mut *self.arena.borrow_mut());
         let described = (|| -> Result<_> {
             let (start, end) = (range.start as u32, range.end as u32);
-            let items = guest.render_items(entry.value.handler, start, end)?;
+            let renderer = entry
+                .value
+                .callback()
+                .ok_or_else(|| anyhow!("not an item renderer"))?;
+            let items = guest.render_items(renderer, start, end)?;
             let ids = guest::record_nodes(self, &guest, &items.nodes)?;
             let roots = items
                 .roots
@@ -822,7 +858,11 @@ impl ShellRuntime {
             let mut keys = Vec::with_capacity(range.len());
             let mut unique = std::collections::HashSet::new();
             for index in range.clone() {
-                let key = guest.item_key(key_entry.value.handler, index as u32)?;
+                let get_key = key_entry
+                    .value
+                    .callback()
+                    .ok_or_else(|| anyhow!("not a key function"))?;
+                let key = guest.item_key(get_key, index as u32)?;
                 anyhow::ensure!(
                     unique.insert(key.clone()),
                     "list get_key returned duplicate key `{key}` in one visible range"
@@ -888,7 +928,10 @@ impl ShellRuntime {
                 if failed {
                     return None;
                 }
-                match guest.item_key(entry.value.handler, index as u32) {
+                let Some(get_key) = entry.value.callback() else {
+                    return None;
+                };
+                match guest.item_key(get_key, index as u32) {
                     Ok(key) => Some(key),
                     Err(error) => {
                         tracing::error!("error in a guest list's get_key: {error:#}");

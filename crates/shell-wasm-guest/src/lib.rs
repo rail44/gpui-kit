@@ -33,6 +33,8 @@ use abi::{Arg, Component, ComponentArg, Description, Node, Op};
 pub use gpui_shell_wasm_abi as abi;
 use serde_json::Value;
 
+pub mod reactive;
+
 pub mod prelude {
     pub use crate::{
         CArg, ComponentState, Cx, Data, Dock, Element, Event, Handler, InputState, Part,
@@ -313,7 +315,7 @@ pub use abi::Data;
 /// A state constructor's argument: plain values only. An element or a
 /// handler has no meaning outside a render, so it becomes `null` and the
 /// host's schema check reports it.
-fn plain_argument(arg: CArg) -> ComponentArg {
+pub(crate) fn plain_argument(arg: CArg) -> ComponentArg {
     match arg {
         CArg::String(value) => ComponentArg::String(value),
         CArg::Number(value) => ComponentArg::Number(value),
@@ -1171,7 +1173,7 @@ mod host {
 }
 
 /// Reclaims a buffer the host wrote through the `alloc` export.
-fn take_string(packed: u64) -> String {
+pub(crate) fn take_string(packed: u64) -> String {
     String::from_utf8(take_bytes(packed)).unwrap_or_default()
 }
 

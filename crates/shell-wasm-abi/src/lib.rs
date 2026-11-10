@@ -307,6 +307,129 @@ pub enum Arg {
     Str(String),
 }
 
+/// The retained protocol (`docs/wasm-retained-guest.md`): the guest builds its
+/// view once, reactively, and sends the host operations on a tree the host
+/// keeps, rather than a whole description per render. A module that exports
+/// [`retained::export::INIT`] speaks it; the host still runs a module that
+/// exports the description protocol's `render` instead.
+pub mod retained {
+    use serde::{Deserialize, Serialize};
+
+    use super::{Arg, ComponentArg};
+
+    /// What a node is. Fixed for the node's life: a registered component
+    /// whose constructor arguments change is recreated.
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+    pub enum Kind {
+        Div,
+        HFlex,
+        VFlex,
+        Text(String),
+        /// The element id.
+        Button(String),
+        /// The element id.
+        Checkbox(String),
+        /// A retained input, by the handle `input_new` returned.
+        Input(u32),
+        /// A component the host's catalog registered, by its constructor's
+        /// export name.
+        Registered {
+            export: String,
+            args: Vec<ComponentArg>,
+        },
+    }
+
+    /// One prop of a node. A node keeps at most one prop per key (the
+    /// style, method or state name), in the order the keys were first set.
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+    pub enum Prop {
+        /// A no-argument style (`size_full`, `items_center`, ...).
+        Style(String),
+        /// A style with arguments (`gap(8)`, `bg("primary")`, ...).
+        ParamStyle(String, Vec<Arg>),
+        /// A behavior method (`checked(true)`, ...).
+        Method(String, Vec<Arg>),
+        /// A method a registered component declares (`label`, `value`, ...).
+        Component(String, Vec<ComponentArg>),
+        /// Styles applied while the node is in a state (`hover`, ...).
+        StateStyle(String, Vec<Prop>),
+    }
+
+    /// One operation on the host's tree. Node ids are the guest's, counted
+    /// up and never reused.
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+    pub enum Mutation {
+        Create {
+            id: u64,
+            kind: Kind,
+        },
+        /// `None` removes the prop under `key`.
+        SetProp {
+            id: u64,
+            key: String,
+            value: Option<Prop>,
+        },
+        SetText {
+            id: u64,
+            text: String,
+        },
+        /// Inserts `child` before `before`, or last; an attached `child`
+        /// moves.
+        Insert {
+            parent: u64,
+            child: u64,
+            before: Option<u64>,
+        },
+        /// Detaches a node; it remains, to be inserted again or disposed.
+        Remove {
+            id: u64,
+        },
+        /// Destroys a node and its descendants.
+        Dispose {
+            id: u64,
+        },
+        /// The node has a handler for `event` (`on_click`, `on_change`).
+        Listen {
+            id: u64,
+            event: String,
+        },
+        Unlisten {
+            id: u64,
+            event: String,
+        },
+        /// Makes `id` the root of `part` (0 is the guest's own view).
+        SetRoot {
+            part: u32,
+            id: u64,
+        },
+    }
+
+    /// What every return from a guest export carries.
+    pub type Batch = Vec<Mutation>;
+
+    /// What an event is addressed to.
+    pub mod target {
+        /// A node's handler for the event named alongside it.
+        pub const NODE: u32 = 0;
+        /// A handler the guest registered through an import (an input's
+        /// submit, a process stream, an HTTP response), by the id it passed.
+        pub const HANDLER: u32 = 1;
+    }
+
+    /// The retained protocol's exports, beside [`super::export::ALLOC`].
+    pub mod export {
+        /// `fn() -> u64`: builds the view and returns the packed, postcard
+        /// encoded [`super::Batch`].
+        pub const INIT: &str = "gpui_retained_init";
+        /// `fn(kind: u32, target: u64, name_ptr: u32, name_len: u32,
+        /// payload_ptr: u32, payload_len: u32) -> u64`: runs the handler
+        /// `kind`/`target` name with the JSON payload, and returns the batch
+        /// it produced. The name and payload are buffers the host wrote
+        /// through `alloc`; the guest owns them.
+        pub const EVENT: &str = "gpui_retained_event";
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

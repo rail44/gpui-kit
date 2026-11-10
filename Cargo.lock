@@ -5126,6 +5126,7 @@ dependencies = [
  "gpui-shell-wasm-abi",
  "postcard",
  "serde_json",
+ "sycamore-reactive",
 ]
 
 [[package]]
@@ -10422,6 +10423,17 @@ dependencies = [
  "skrifa 0.44.0",
  "yazi",
  "zeno",
+]
+
+[[package]]
+name = "sycamore-reactive"
+version = "0.9.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aca468d1209c2d1ae3059fb93aa005e67bbe1f17375a3c0a65135e98a1b58829"
+dependencies = [
+ "paste",
+ "slotmap",
+ "smallvec",
 ]
 
 [[package]]

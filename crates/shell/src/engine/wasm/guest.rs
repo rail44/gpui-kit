@@ -31,9 +31,11 @@
 //!   only whether it changed state.
 //! * Descriptions cross as postcard; handler payloads as JSON.
 
+mod retained;
+
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     path::Path,
     rc::{Rc, Weak},
 };
@@ -45,7 +47,7 @@ use serde_json::Value as Json;
 use smallvec::SmallVec;
 use wasmtime::{Caller, Extern, Instance, Linker, Memory, Module, Store, TypedFunc};
 
-use super::{ShellRuntime, finish_task, own_task};
+use super::{HandlerTarget, ShellRuntime, finish_task, own_task};
 use crate::{
     entities::{EntityHandle, InputEventName},
     runtime::ApplicationGeneration,
@@ -54,6 +56,7 @@ use crate::{
     value::Bridged,
     view::ScriptView,
 };
+use abi::retained::target as retained_target;
 
 /// Read and write are separate grants, so the denial names the half that was
 /// missing.
@@ -114,30 +117,7 @@ pub(super) fn record_nodes(
     for node in nodes {
         let id = match &node.component {
             abi::Component::Registered { export, args } => {
-                let (component_id, name, constructor) = runtime
-                    .components
-                    .registered()
-                    .find_map(|(component_id, descriptor)| {
-                        descriptor
-                            .constructors()
-                            .iter()
-                            .find(|constructor| constructor.export() == export)
-                            .map(|constructor| {
-                                (component_id, descriptor.name(), constructor.clone())
-                            })
-                    })
-                    .ok_or_else(|| anyhow!("no registered component exports `{export}`"))?;
-                let target = ArgumentTarget {
-                    api: export,
-                    descriptors: constructor.arguments(),
-                };
-                let arguments = component_arguments(runtime, guest, &ids, target, args)?;
-                let payload = constructor
-                    .payload(&arguments)
-                    .map_err(|error| anyhow!("{export}(...): {error}"))?;
-                runtime.arena_mut().push(Component::Registered(
-                    crate::spec::RegisteredComponentSpec::new(component_id, name, payload),
-                ))
+                registered_node(runtime, guest, &ids, export, args)?
             }
             abi::Component::Nested(part) => nested_view(runtime, guest, *part)?,
             abi::Component::Dock(handle) => runtime
@@ -174,34 +154,10 @@ pub(super) fn record_nodes(
                     crate::style::nullary_index(name)
                         .ok_or_else(|| anyhow!("unknown style `{name}`"))?,
                 ),
-                Op::ParamStyle(name, args) => {
-                    let name = crate::style::param_style_name(name)
-                        .ok_or_else(|| anyhow!("unknown style `{name}`"))?;
-                    let mut args = bridged(args);
-                    // A script reads a color as `cx.theme().colors.primary`; a
-                    // guest names the token instead, resolved here against the
-                    // theme the build synced.
-                    if COLOR_STYLES.contains(&name) {
-                        for arg in &mut args {
-                            if let Bridged::Str(value) = arg
-                                && !value.starts_with('#')
-                            {
-                                let color = crate::theme_tokens::token_color(value)
-                                    .ok_or_else(|| anyhow!("unknown color token `{value}`"))?;
-                                *value = hex(color);
-                            }
-                        }
-                    }
-                    SpecOp::ParamStyle(name, args)
-                }
+                Op::ParamStyle(name, args) => param_style(name, args)?,
                 Op::Method(name, args) => SpecOp::Method(intern(name), bridged(args)),
                 Op::Callback(name, callback) => {
-                    let name = match name.as_str() {
-                        "on_click" => "on_click",
-                        "on_change" => "on_change",
-                        other => anyhow::bail!("unsupported handler `{other}`"),
-                    };
-                    SpecOp::Callback(name, runtime.register(guest, *callback))
+                    SpecOp::Callback(handler_name(name)?, runtime.register(guest, *callback))
                 }
                 Op::Slot(name, index) => {
                     let element = *ids
@@ -215,12 +171,7 @@ pub(super) fn record_nodes(
                     SpecOp::Slot(name, element)
                 }
                 Op::StateStyle(name, index) => {
-                    let name = match name.as_str() {
-                        "hover" => "hover",
-                        "active" => "active",
-                        "focus" => "focus",
-                        other => anyhow::bail!("unsupported state style `{other}`"),
-                    };
+                    let name = state_style_name(name)?;
                     let styles = *ids
                         .get(*index as usize)
                         .ok_or_else(|| anyhow!("state style node {index} comes after its user"))?;
@@ -232,20 +183,7 @@ pub(super) fn record_nodes(
                     SpecOp::StateStyle(name, styles)
                 }
                 Op::Component(name, args) => {
-                    let method = registered_method_descriptor(runtime, id, name)
-                        .ok_or_else(|| anyhow!("the component has no method `{name}`"))?;
-                    let target = ArgumentTarget {
-                        api: name,
-                        descriptors: method.arguments(),
-                    };
-                    let arguments = component_arguments(runtime, guest, &ids, target, args)?;
-                    let payload = method
-                        .record(&arguments)
-                        .map_err(|error| anyhow!("{name}(...): {error}"))?;
-                    SpecOp::RegisteredMethod(crate::RecordedComponentMethod::new(
-                        method.name(),
-                        payload,
-                    ))
+                    registered_method(runtime, guest, &ids, id, name, args)?
                 }
             };
             runtime
@@ -265,6 +203,101 @@ pub(super) fn record_nodes(
     }
 
     Ok(ids)
+}
+
+/// A registered component's node, its constructor arguments checked against
+/// the catalog's schemas. `ids` resolves element arguments by index.
+fn registered_node(
+    runtime: &Rc<ShellRuntime>,
+    guest: &Rc<Guest>,
+    ids: &[SpecId],
+    export: &str,
+    args: &[abi::ComponentArg],
+) -> Result<SpecId> {
+    let (component_id, name, constructor) = runtime
+        .components
+        .registered()
+        .find_map(|(component_id, descriptor)| {
+            descriptor
+                .constructors()
+                .iter()
+                .find(|constructor| constructor.export() == export)
+                .map(|constructor| (component_id, descriptor.name(), constructor.clone()))
+        })
+        .ok_or_else(|| anyhow!("no registered component exports `{export}`"))?;
+    let target = ArgumentTarget {
+        api: export,
+        descriptors: constructor.arguments(),
+    };
+    let arguments = component_arguments(runtime, guest, ids, target, args)?;
+    let payload = constructor
+        .payload(&arguments)
+        .map_err(|error| anyhow!("{export}(...): {error}"))?;
+    Ok(runtime.arena_mut().push(Component::Registered(
+        crate::spec::RegisteredComponentSpec::new(component_id, name, payload),
+    )))
+}
+
+/// A method call on the registered component node `id`.
+fn registered_method(
+    runtime: &Rc<ShellRuntime>,
+    guest: &Rc<Guest>,
+    ids: &[SpecId],
+    id: SpecId,
+    name: &str,
+    args: &[abi::ComponentArg],
+) -> Result<SpecOp> {
+    let method = registered_method_descriptor(runtime, id, name)
+        .ok_or_else(|| anyhow!("the component has no method `{name}`"))?;
+    let target = ArgumentTarget {
+        api: name,
+        descriptors: method.arguments(),
+    };
+    let arguments = component_arguments(runtime, guest, ids, target, args)?;
+    let payload = method
+        .record(&arguments)
+        .map_err(|error| anyhow!("{name}(...): {error}"))?;
+    Ok(SpecOp::RegisteredMethod(
+        crate::RecordedComponentMethod::new(method.name(), payload),
+    ))
+}
+
+/// A style with arguments. A script reads a color as
+/// `cx.theme().colors.primary`; a guest names the token instead, resolved
+/// here against the theme the build synced.
+fn param_style(name: &str, args: &[Arg]) -> Result<SpecOp> {
+    let name =
+        crate::style::param_style_name(name).ok_or_else(|| anyhow!("unknown style `{name}`"))?;
+    let mut args = bridged(args);
+    if COLOR_STYLES.contains(&name) {
+        for arg in &mut args {
+            if let Bridged::Str(value) = arg
+                && !value.starts_with('#')
+            {
+                let color = crate::theme_tokens::token_color(value)
+                    .ok_or_else(|| anyhow!("unknown color token `{value}`"))?;
+                *value = hex(color);
+            }
+        }
+    }
+    Ok(SpecOp::ParamStyle(name, args))
+}
+
+fn handler_name(name: &str) -> Result<&'static str> {
+    Ok(match name {
+        "on_click" => "on_click",
+        "on_change" => "on_change",
+        other => anyhow::bail!("unsupported handler `{other}`"),
+    })
+}
+
+fn state_style_name(name: &str) -> Result<&'static str> {
+    Ok(match name {
+        "hover" => "hover",
+        "active" => "active",
+        "focus" => "focus",
+        other => anyhow::bail!("unsupported state style `{other}`"),
+    })
 }
 
 /// The element slots a component takes, by the names the script API uses.
@@ -520,15 +553,25 @@ fn intern(name: &str) -> &'static str {
 }
 
 /// What a script's `cx.notify()` does for its own view (invalidate the
-/// description and let GPUI schedule the frame) for every view showing the
-/// guest: its root and each part, since they all read the same guest state.
-fn refresh_guest(guest: &Guest) {
+/// description and let GPUI schedule the frame) for the views showing the
+/// guest's `parts`, or all of them: a description guest's parts all read the
+/// same state, while a retained guest's batch names the parts it touched.
+fn refresh_guest(guest: &Guest, parts: Option<&BTreeSet<u32>>) {
     let views: Vec<_> = guest
         .views
         .borrow()
         .iter()
-        .filter_map(WeakEntity::upgrade)
+        .filter(|(part, _)| parts.is_none_or(|parts| parts.contains(part)))
+        .filter_map(|(_, view)| view.upgrade())
         .collect();
+    if parts.is_some() {
+        scope::with_current_app(|app| {
+            for view in views {
+                view.update(app, |view, cx| view.refresh(cx));
+            }
+        });
+        return;
+    }
     let views = if views.is_empty() {
         scope::current_view().into_iter().collect()
     } else {
@@ -683,19 +726,50 @@ fn open_pending(runtime: &Rc<ShellRuntime>, guest: &Rc<Guest>) -> Result<()> {
     Ok(())
 }
 
-/// Runs guest handler `handler` with `payload`, inside the event scope the
-/// caller opened: re-renders the guest's views if it asked to, then opens
-/// whatever it asked for.
+/// Runs the handler `target` names with `payload`, inside the event scope
+/// the caller opened: refreshes the views it changed, then opens whatever it
+/// asked for.
 pub(super) fn handle(
     runtime: &Rc<ShellRuntime>,
     guest: &Rc<Guest>,
-    handler: u32,
+    target: &HandlerTarget,
     payload: &Json,
 ) -> Result<()> {
-    if guest.dispatch(handler, payload.to_string().as_bytes())? {
-        refresh_guest(guest);
+    let payload = payload.to_string();
+    match (&guest.protocol, target) {
+        (Protocol::Describe { .. }, HandlerTarget::Callback(handler)) => {
+            if guest.dispatch(*handler, payload.as_bytes())? {
+                refresh_guest(guest, None);
+            }
+        }
+        (Protocol::Retained { .. }, HandlerTarget::Node(id, event)) => {
+            guest.retained_event(retained_target::NODE, *id, event, payload.as_bytes())?;
+        }
+        (Protocol::Retained { .. }, HandlerTarget::Callback(token)) => {
+            guest.retained_event(
+                retained_target::HANDLER,
+                u64::from(*token),
+                "",
+                payload.as_bytes(),
+            )?;
+        }
+        (Protocol::Describe { .. }, HandlerTarget::Node(..)) => {
+            anyhow::bail!("a node handler for a guest that describes its view")
+        }
     }
     open_pending(runtime, guest)
+}
+
+/// Builds `part`'s description into the runtime's scratch arena: by running
+/// a description guest's render, or by copying a retained guest's tree.
+pub(super) fn describe(runtime: &Rc<ShellRuntime>, guest: &Rc<Guest>, part: u32) -> Result<SpecId> {
+    match &guest.protocol {
+        Protocol::Describe { .. } => {
+            let description = guest.render(part)?;
+            record(runtime, guest, &description)
+        }
+        Protocol::Retained { tree, .. } => retained::record(runtime, guest, &tree.borrow(), part),
+    }
 }
 
 /// Runs the guest's `init` under the scope of its root view, when it has one
@@ -707,12 +781,20 @@ pub(super) fn initialize(
 ) -> Result<()> {
     if let Some(view) = view {
         guest.store.borrow_mut().data_mut().view = Some(view.downgrade());
-        guest.add_view(view);
+        guest.add_view(view, 0);
     }
-    guest
-        .init
-        .call(&mut *guest.store.borrow_mut(), ())
-        .map_err(|error| anyhow!("guest init failed: {error:#}"))?;
+    match &guest.protocol {
+        Protocol::Describe { init, .. } => init
+            .call(&mut *guest.store.borrow_mut(), ())
+            .map_err(|error| anyhow!("guest init failed: {error:#}"))?,
+        Protocol::Retained { init, tree, .. } => {
+            let packed = init
+                .call(&mut *guest.store.borrow_mut(), ())
+                .map_err(|error| anyhow!("guest init failed: {error:#}"))?;
+            let batch = guest.batch(packed)?;
+            tree.borrow_mut().apply(batch)?;
+        }
+    }
     // A dialog or panel the guest opened from `init`.
     open_pending(runtime, guest)
 }
@@ -818,22 +900,36 @@ struct PendingPanel {
     placement: String,
 }
 
+/// Which protocol a guest module speaks, by the exports it has.
+enum Protocol {
+    /// The guest re-describes a part on every render.
+    Describe {
+        init: TypedFunc<(), ()>,
+        render: TypedFunc<u32, u64>,
+        render_items: TypedFunc<(u32, u32, u32), u64>,
+        item_key: TypedFunc<(u32, u32), u64>,
+        dispatch: TypedFunc<(u32, u32, u32), u32>,
+    },
+    /// The guest sends operations on a tree the host keeps.
+    Retained {
+        init: TypedFunc<(), u64>,
+        event: TypedFunc<(u32, u64, u32, u32, u32, u32), u64>,
+        tree: RefCell<retained::Tree>,
+    },
+}
+
 /// One instantiated guest module.
 pub(crate) struct Guest {
     store: RefCell<Store<HostState>>,
     memory: Memory,
-    init: TypedFunc<(), ()>,
-    render: TypedFunc<u32, u64>,
-    render_items: TypedFunc<(u32, u32, u32), u64>,
-    item_key: TypedFunc<(u32, u32), u64>,
-    dispatch: TypedFunc<(u32, u32, u32), u32>,
+    protocol: Protocol,
     alloc: TypedFunc<u32, u32>,
     /// The application generation the guest belongs to; its release stops
     /// what the guest started.
     application: Rc<ApplicationGeneration>,
-    /// Every view showing the guest (its root and its parts), so a notify
-    /// re-renders all of them.
-    views: RefCell<Vec<WeakEntity<ScriptView>>>,
+    /// Every view showing the guest (its root and its parts), with the part
+    /// each shows.
+    views: RefCell<Vec<(u32, WeakEntity<ScriptView>)>>,
     /// The child view each nested part is drawn through, by part.
     nested: RefCell<HashMap<u32, EntityHandle>>,
     /// Parts the guest asked to open as dialogs, not yet opened.
@@ -883,12 +979,26 @@ impl Guest {
         let memory = instance
             .get_memory(&mut store, "memory")
             .ok_or_else(|| anyhow!("the guest exports no memory"))?;
+        let protocol = if instance
+            .get_export(&mut store, abi::retained::export::INIT)
+            .is_some()
+        {
+            Protocol::Retained {
+                init: instance.get_typed_func(&mut store, abi::retained::export::INIT)?,
+                event: instance.get_typed_func(&mut store, abi::retained::export::EVENT)?,
+                tree: RefCell::new(retained::Tree::default()),
+            }
+        } else {
+            Protocol::Describe {
+                init: instance.get_typed_func(&mut store, abi::export::INIT)?,
+                render: instance.get_typed_func(&mut store, abi::export::RENDER)?,
+                render_items: instance.get_typed_func(&mut store, abi::export::RENDER_ITEMS)?,
+                item_key: instance.get_typed_func(&mut store, abi::export::ITEM_KEY)?,
+                dispatch: instance.get_typed_func(&mut store, abi::export::DISPATCH)?,
+            }
+        };
         let guest = Rc::new(Guest {
-            init: instance.get_typed_func(&mut store, abi::export::INIT)?,
-            render: instance.get_typed_func(&mut store, abi::export::RENDER)?,
-            render_items: instance.get_typed_func(&mut store, abi::export::RENDER_ITEMS)?,
-            item_key: instance.get_typed_func(&mut store, abi::export::ITEM_KEY)?,
-            dispatch: instance.get_typed_func(&mut store, abi::export::DISPATCH)?,
+            protocol,
             alloc: instance.get_typed_func(&mut store, abi::export::ALLOC)?,
             store: RefCell::new(store),
             memory,
@@ -911,8 +1021,43 @@ impl Guest {
         Some(self.application.clone())
     }
 
-    pub(super) fn add_view(&self, view: &Entity<ScriptView>) {
-        self.views.borrow_mut().push(view.downgrade());
+    pub(super) fn add_view(&self, view: &Entity<ScriptView>, part: u32) {
+        self.views.borrow_mut().push((part, view.downgrade()));
+    }
+
+    /// Reads a batch a retained guest returned.
+    fn batch(&self, packed: u64) -> Result<abi::retained::Batch> {
+        let bytes = read(&self.memory, &*self.store.borrow(), packed)?;
+        postcard::from_bytes(&bytes).context("guest returned a malformed batch")
+    }
+
+    /// Copies `bytes` into a buffer the guest allocated; the guest owns it.
+    fn give(&self, bytes: &[u8]) -> Result<(u32, u32)> {
+        let mut store = self.store.borrow_mut();
+        let len = bytes.len() as u32;
+        let ptr = self.alloc.call(&mut *store, len)?;
+        self.memory.write(&mut *store, ptr as usize, bytes)?;
+        Ok((ptr, len))
+    }
+
+    /// Runs a retained guest's handler and applies the batch it returns,
+    /// refreshing the parts it touched.
+    fn retained_event(&self, kind: u32, target: u64, name: &str, payload: &[u8]) -> Result<()> {
+        let Protocol::Retained { event, tree, .. } = &self.protocol else {
+            anyhow::bail!("not a retained guest");
+        };
+        let (name_ptr, name_len) = self.give(name.as_bytes())?;
+        let (payload_ptr, payload_len) = self.give(payload)?;
+        let packed = event
+            .call(
+                &mut *self.store.borrow_mut(),
+                (kind, target, name_ptr, name_len, payload_ptr, payload_len),
+            )
+            .map_err(|error| anyhow!("guest handler failed: {error:#}"))?;
+        let batch = self.batch(packed)?;
+        let parts = tree.borrow_mut().apply(batch)?;
+        refresh_guest(self, Some(&parts));
+        Ok(())
     }
 
     /// Stops every process and socket the guest started.
@@ -931,9 +1076,11 @@ impl Guest {
 
     /// Renders the guest's view (`part` 0) or one of its parts.
     pub(super) fn render(&self, part: u32) -> Result<Description> {
+        let Protocol::Describe { render, .. } = &self.protocol else {
+            anyhow::bail!("a retained guest has no render");
+        };
         let mut store = self.store.borrow_mut();
-        let packed = self
-            .render
+        let packed = render
             .call(&mut *store, part)
             .map_err(|error| anyhow!("guest render failed: {error:#}"))?;
         let bytes = read(&self.memory, &*store, packed)?;
@@ -942,9 +1089,11 @@ impl Guest {
 
     /// Describes items `start..end` of one of the guest's lists.
     pub(super) fn render_items(&self, renderer: u32, start: u32, end: u32) -> Result<abi::Items> {
+        let Protocol::Describe { render_items, .. } = &self.protocol else {
+            anyhow::bail!("a retained guest has no item renderer");
+        };
         let mut store = self.store.borrow_mut();
-        let packed = self
-            .render_items
+        let packed = render_items
             .call(&mut *store, (renderer, start, end))
             .map_err(|error| anyhow!("guest item renderer failed: {error:#}"))?;
         let bytes = read(&self.memory, &*store, packed)?;
@@ -953,9 +1102,11 @@ impl Guest {
 
     /// The key of one of the guest's list items.
     pub(super) fn item_key(&self, get_key: u32, index: u32) -> Result<String> {
+        let Protocol::Describe { item_key, .. } = &self.protocol else {
+            anyhow::bail!("a retained guest has no key function");
+        };
         let mut store = self.store.borrow_mut();
-        let packed = self
-            .item_key
+        let packed = item_key
             .call(&mut *store, (get_key, index))
             .map_err(|error| anyhow!("guest item key failed: {error:#}"))?;
         Ok(String::from_utf8(read(&self.memory, &*store, packed)?)?)
@@ -963,12 +1114,12 @@ impl Guest {
 
     /// Runs guest handler `callback`. Returns whether it asked to re-render.
     fn dispatch(&self, callback: u32, payload: &[u8]) -> Result<bool> {
+        let Protocol::Describe { dispatch, .. } = &self.protocol else {
+            anyhow::bail!("a retained guest has no dispatch");
+        };
+        let (ptr, len) = self.give(payload)?;
         let mut store = self.store.borrow_mut();
-        let len = payload.len() as u32;
-        let ptr = self.alloc.call(&mut *store, len)?;
-        self.memory.write(&mut *store, ptr as usize, payload)?;
-        let notify = self
-            .dispatch
+        let notify = dispatch
             .call(&mut *store, (callback, ptr, len))
             .map_err(|error| anyhow!("guest handler failed: {error:#}"))?;
         Ok(notify != 0)
@@ -1014,7 +1165,7 @@ impl Guest {
             policy,
             self.application(),
         );
-        if let Err(error) = handle(&runtime, self, callback, payload) {
+        if let Err(error) = handle(&runtime, self, &HandlerTarget::Callback(callback), payload) {
             tracing::error!("wasm guest handler failed: {error:#}");
         }
     }
@@ -2648,7 +2799,14 @@ mod tests {
             .guests
             .borrow()
             .iter()
-            .flat_map(|guest| guest.views.borrow().clone())
+            .flat_map(|guest| {
+                guest
+                    .views
+                    .borrow()
+                    .iter()
+                    .map(|(_, view)| view.clone())
+                    .collect::<Vec<_>>()
+            })
             .collect();
         cx.update(|_, _| {
             views

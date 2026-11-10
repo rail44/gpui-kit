@@ -1,9 +1,10 @@
 # WebAssembly guests: reactive views and a retained host tree
 
 > [!NOTE]
-> A design, agreed on 2026-11-11 and not yet implemented. It replaces how the
-> `wasm-engine` build (`crates/shell/src/engine/wasm`) moves a view across the
-> guest/host boundary. Everything else about that engine stays as it is.
+> A design, agreed on 2026-11-11, and partly implemented; see "Where it
+> stands" at the end. It changes how the `wasm-engine` build
+> (`crates/shell/src/engine/wasm`) moves a view across the guest/host
+> boundary. Everything else about that engine stays as it is.
 
 ## Why
 
@@ -183,3 +184,40 @@ optional wrapper that feeds them into a signal.
 - Templates for repeated structure (measure operation counts first).
 - Handlers that return values.
 - Builder methods only, or also a `view!` macro.
+
+## Where it stands
+
+`examples/wasm_todolist` runs on this protocol. The host tells the two
+protocols apart by the exports a module has, so every other example still
+describes its view per render, unchanged.
+
+Implemented:
+
+- The ABI's `retained` module, and the guest SDK's `reactive` module on
+  `sycamore-reactive`: nodes for div, flex, text, button, checkbox, input and
+  registered components, fixed or reactive props, `hover`, keyed lists
+  (`Node::each`), node handlers, an input's submit, and `export_reactive!`.
+- The host's tree (`engine/wasm/guest/retained.rs`), applied batch by batch
+  with a broken guest's later batches refused, copied into the spec arena
+  when a part draws, and refreshing only the parts a batch touched.
+
+Measured with `scripts/compare-engines.sh` (release, three alternating
+runs, load average about 7): the todo list with 100 rows describes in
+0.18 to 0.25 ms against 0.68 to 0.89 ms when its guest re-rendered, and its
+tree is identical to the script twin's. A filter click costs 0.011 to
+0.016 ms instead of 0.002 to 0.003 ms, since the guest's effects, the
+batch's encoding and its application now happen in the event rather than
+in the next render.
+
+Simplified or not yet done:
+
+- Events from retained state and resources arrive as `HANDLER` events
+  addressed by the callback id the guest passed to the import, rather than
+  as separate state and resource targets.
+- Node numbers are not yet element keys; elements are still keyed by their
+  arena position.
+- A style removed and set again goes after the node's other props, so its
+  position can differ from what the same calls would record in a script.
+- Lazy lists, parts other than the root (dialogs, sheets, panels, nested
+  views), releasing retained state with its reactive owner, and large
+  payloads as raw bytes are not implemented for retained guests yet.

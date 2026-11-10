@@ -9,3 +9,6 @@ publish = false
 gpui-shell-wasm-abi = { path = "../shell-wasm-abi" }
 serde_json = { workspace = true }
 postcard = { version = "1.1", default-features = false, features = ["alloc"] }
+# The reactive graph under `reactive`: synchronous effects and no imports
+# (docs/wasm-retained-guest.md).
+sycamore-reactive = "0.9.4"
