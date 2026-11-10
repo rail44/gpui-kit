@@ -16,22 +16,26 @@
 //!
 //! What a guest reaches: the `gpui-base` elements, state styles, named slots,
 //! registered components (validated against their schemas like a script's
-//! arguments) and their retained state (methods and input events); and,
-//! under the application's capabilities, the persistent and session stores,
-//! the clipboard, files, processes and HTTP. Calls a script makes
-//! asynchronously are asynchronous here too, callback-style (a core module
-//! has no promise to settle): the work runs on the background executor and
-//! the handler back on the main thread. Store writes reach the disk the same
-//! way. Modules and instances are released with their application generation.
+//! arguments) and their retained state (methods and input events), lazily
+//! rendered lists, and *parts* — render functions shown by views of their
+//! own, as nested child views, dialogs or dock panels; toasts; and, under the
+//! application's capabilities, the persistent and session stores, the
+//! clipboard, files, processes (run or streamed), HTTP and WebSockets.
+//! Calls a script makes asynchronously are asynchronous here too,
+//! callback-style (a core module has no promise to settle): the work runs
+//! off the main thread and the handler back on it, once per event for a
+//! stream. Modules, instances, processes and sockets are released with their
+//! application generation.
 //!
 //! Known gaps, deliberately left for after the spike:
 //!
-//! * Not reachable yet: virtualized lists, nested views, sockets, streamed
-//!   processes, overlays (dialogs, sheets, toasts) and the dock. Each needs
-//!   a guest-side shape of its own (a renderer called during layout, a
-//!   child guest, a stream of events, a window-level surface).
-//! * The JavaScript engine still hosts every guest (a generated view class
-//!   per module); this is a guest *kind* next to scripts, not a second engine.
+//! * The JavaScript engine still hosts every guest: a generated view class
+//!   per module, and JS function objects in the callback arena. This is a
+//!   guest *kind* next to scripts, not a second engine; removing QuickJS
+//!   would mean reimplementing `ShellRuntime`, which is what this approach
+//!   exists to reuse.
+//! * Not reached: process stdin, binary socket messages, dock layout
+//!   persistence and chrome (the dock is the bare skin), sheets.
 //! * Descriptions cross as postcard; handler payloads as JSON. The grid test
 //!   below times the guest beside the script.
 
@@ -330,6 +334,10 @@ fn record_nodes(
                 ))
             }
             abi::Component::Nested(part) => nested_view(ctx, runtime, guest, *part)?,
+            abi::Component::Dock(handle) => runtime
+                .arena_mut()
+                .push_dock_area(EntityHandle::from(*handle))
+                .map_err(|error| fail(error.to_string()))?,
             abi::Component::List {
                 id,
                 count,
@@ -629,6 +637,7 @@ fn component(component: &abi::Component) -> Component {
         abi::Component::Input(handle) => Component::Input(EntityHandle::from(*handle)),
         abi::Component::Registered { .. }
         | abi::Component::Nested(_)
+        | abi::Component::Dock(_)
         | abi::Component::List { .. } => unreachable!("recorded by `record_nodes`"),
     }
 }
@@ -815,6 +824,37 @@ fn nested_view(
 /// making one needs the JavaScript context, which a module import does not
 /// have; the request waits in the guest until a caller that has it gets here.
 fn open_pending_dialogs(ctx: &Ctx<'_>, runtime: &Rc<ShellRuntime>, guest: &Guest) -> JsResult<()> {
+    // Panels wait for the same reason: a panel's body is a view.
+    let panels = std::mem::take(&mut *guest.pending_panels.borrow_mut());
+    for panel in panels {
+        let view = part_view(ctx, runtime, guest, panel.part, None)?;
+        let placement = match panel.placement.as_str() {
+            "left" => gpui_base::dock::DockPlacement::Left,
+            "right" => gpui_base::dock::DockPlacement::Right,
+            "bottom" => gpui_base::dock::DockPlacement::Bottom,
+            "center" => gpui_base::dock::DockPlacement::Center,
+            other => {
+                return Err(js_error::type_error(
+                    ctx,
+                    &format!(
+                        "`{other}` is not a dock placement; use left, right, bottom or center"
+                    ),
+                ));
+            }
+        };
+        let area = runtime.entities().dock(panel.dock).ok_or_else(|| {
+            js_error::type_error(ctx, "the dock area was released before its panel was added")
+        })?;
+        let name = crate::dock::panel_name("wasm-guest", &panel.name);
+        scope::with_current(move |window, cx| {
+            let panel = cx.new(|cx| crate::dock::ScriptPanel::new(name, view, cx));
+            area.update(cx, |area, cx| {
+                area.add_panel(panel, placement, None, window, cx)
+            });
+        })
+        .ok_or_else(|| js_error::type_error(ctx, "adding a panel needs a live host call"))?;
+    }
+
     let pending = std::mem::take(&mut *guest.pending_dialogs.borrow_mut());
     for part in pending {
         let view = part_view(ctx, runtime, guest, part, None)?;
@@ -832,6 +872,14 @@ fn open_pending_dialogs(ctx: &Ctx<'_>, runtime: &Rc<ShellRuntime>, guest: &Guest
         }
     }
     Ok(())
+}
+
+/// A panel a guest asked to dock.
+struct PendingPanel {
+    dock: EntityHandle,
+    part: u32,
+    name: String,
+    placement: String,
 }
 
 /// One instantiated guest module.
@@ -855,6 +903,8 @@ struct Guest {
     nested: RefCell<HashMap<u32, EntityHandle>>,
     /// Parts the guest asked to open as dialogs, not yet opened.
     pending_dialogs: RefCell<Vec<u32>>,
+    /// Panels the guest asked to dock, not yet added.
+    pending_panels: RefCell<Vec<PendingPanel>>,
     /// Processes and sockets the guest started, by the id it was handed.
     resources: RefCell<Vec<Option<Resource>>>,
 }
@@ -935,6 +985,7 @@ impl Guest {
             ),
             nested: RefCell::new(HashMap::new()),
             pending_dialogs: RefCell::new(Vec::new()),
+            pending_panels: RefCell::new(Vec::new()),
             resources: RefCell::new(Vec::new()),
         });
         guest.store.borrow_mut().data_mut().guest = Rc::downgrade(&guest);
@@ -1030,7 +1081,7 @@ impl Guest {
             Err(error) => tracing::error!("wasm guest handler failed: {error:#}"),
         }
         // No script call is running here, so the context is free to open.
-        if !self.pending_dialogs.borrow().is_empty()
+        if (!self.pending_dialogs.borrow().is_empty() || !self.pending_panels.borrow().is_empty())
             && let Err(error) = runtime.with_js(|ctx| open_pending_dialogs(ctx, &runtime, self))
         {
             tracing::error!("wasm guest dialog failed: {error:#}");
@@ -1752,6 +1803,62 @@ fn link_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     .map_err(|_| anyhow!("socket {id} is closed")),
                 _ => Err(anyhow!("no open socket {id}")),
             }
+        },
+    )?;
+    // Docks: an area made from `init` or a handler, and panels whose bodies
+    // are the guest's parts.
+    linker.func_wrap(
+        module,
+        abi::import::DOCK_NEW,
+        |mut caller: Caller<'_, HostState>, id_ptr: u32, id_len: u32| -> Result<u64> {
+            let id = read_string(&mut caller, id_ptr, id_len)?;
+            anyhow::ensure!(
+                !matches!(
+                    scope::current_phase(),
+                    Some(ScopePhase::Render | ScopePhase::Layout)
+                ),
+                "Dock::new cannot run during render; create a dock in init or a handler"
+            );
+            let runtime = runtime_of(&caller)?;
+            scope::with_current(|window, cx| {
+                runtime.entities().create_dock(
+                    &id,
+                    None,
+                    crate::dock::ScriptDockSkin::default(),
+                    scope::current_application_generation(),
+                    window,
+                    cx,
+                )
+            })
+            .ok_or_else(|| anyhow!("Dock::new needs a live host call"))?
+            .map_err(|_| anyhow!("too many retained entities"))
+        },
+    )?;
+    linker.func_wrap(
+        module,
+        abi::import::DOCK_ADD_PANEL,
+        |mut caller: Caller<'_, HostState>,
+         dock: u64,
+         part: u32,
+         name_ptr: u32,
+         name_len: u32,
+         placement_ptr: u32,
+         placement_len: u32|
+         -> Result<()> {
+            let name = read_string(&mut caller, name_ptr, name_len)?;
+            let placement = read_string(&mut caller, placement_ptr, placement_len)?;
+            let guest = caller
+                .data()
+                .guest
+                .upgrade()
+                .ok_or_else(|| anyhow!("the guest is gone"))?;
+            guest.pending_panels.borrow_mut().push(PendingPanel {
+                dock: EntityHandle::from(dock),
+                part,
+                name,
+                placement,
+            });
+            Ok(())
         },
     )?;
     // Overlays, from a handler or a task only, as a script's are.
@@ -2988,6 +3095,35 @@ mod tests {
         // guest asked for.
         assert!(tree.contains("Messages: hello,echo ping"), "{tree}");
         assert!(tree.contains("Closed: true"), "{tree}");
+    }
+
+    #[gpui::test]
+    fn a_guest_docks_its_parts_as_panels(cx: &mut TestAppContext) {
+        let mut app = Harness::load_example(cx, "wasm_dock");
+        let tree = app.tree();
+        assert!(tree.contains("dock"), "{tree}");
+
+        // Both parts are panels in the dock, drawn by it.
+        let panels = part_views(&mut app.context, &app.view);
+        assert_eq!(panels.len(), 2, "{tree}");
+        let trees: Vec<String> = panels.iter().map(|panel| app.tree_of(panel)).collect();
+        let files = panels[trees
+            .iter()
+            .position(|tree| tree.contains("Files"))
+            .expect("files")]
+        .clone();
+        let editor = panels[trees
+            .iter()
+            .position(|tree| tree.contains("Editor"))
+            .expect("editor")]
+        .clone();
+        assert!(app.tree_of(&editor).contains("nothing open"));
+
+        // A click in one panel changes what the other shows.
+        let open = app.handler_in(&files, "open-lib.rs", "on_click");
+        app.dispatch_click(open);
+        let editor_tree = app.tree_of(&editor);
+        assert!(editor_tree.contains("\"lib.rs\""), "{editor_tree}");
     }
 
     #[gpui::test]

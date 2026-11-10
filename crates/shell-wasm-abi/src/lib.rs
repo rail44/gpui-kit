@@ -147,6 +147,13 @@ pub mod import {
     pub const SOCKET_SEND: &str = "socket_send";
     /// `fn(id: u32)`: stops a resource — kills a process, closes a socket.
     pub const RESOURCE_STOP: &str = "resource_stop";
+    /// `fn(id_ptr: u32, id_len: u32) -> u64`: creates a dock area (from
+    /// `init` or a handler) and returns its handle.
+    pub const DOCK_NEW: &str = "dock_new";
+    /// `fn(dock: u64, part: u32, name_ptr: u32, name_len: u32,
+    /// placement_ptr: u32, placement_len: u32)`: docks a part as a panel at
+    /// `left`, `right`, `bottom` or `center`.
+    pub const DOCK_ADD_PANEL: &str = "dock_add_panel";
     /// `fn(toast_ptr: u32, toast_len: u32)`: shows a toast described as JSON
     /// `{"title", "description", "level"}`.
     pub const PUSH_TOAST: &str = "push_toast";
@@ -211,6 +218,10 @@ pub enum Component {
     /// A part of the guest drawn in place by a view of its own (a script's
     /// child view), by the part number the guest registered.
     Nested(u32),
+    /// A dock area, by the handle `dock_new` returned: panels docked left,
+    /// right, bottom and center, draggable and resizable — a script's
+    /// `DockArea`.
+    Dock(u64),
     /// A lazily rendered list of `count` uniform items: the host asks for
     /// the visible range during layout through the guest's
     /// [`export::RENDER_ITEMS`] with `render_items`, and for item keys

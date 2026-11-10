@@ -1,0 +1,20 @@
+[package]
+name = "wasm-dock"
+description = "Spike: a guest that docks its parts as panels."
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Built for `wasm32-unknown-unknown` on its own; see examples/wasm_todolist.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+gpui-shell-wasm-guest = { path = "../../crates/shell-wasm-guest" }
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true

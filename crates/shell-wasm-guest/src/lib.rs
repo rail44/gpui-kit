@@ -35,8 +35,9 @@ use serde_json::Value;
 
 pub mod prelude {
     pub use crate::{
-        CArg, ComponentState, Cx, Data, Element, Event, Handler, InputState, Part, ToastLevel,
-        View, button, checkbox, component, div, export_view, h_flex, input, nested, text, v_flex,
+        CArg, ComponentState, Cx, Data, Dock, Element, Event, Handler, InputState, Part,
+        ToastLevel, View, button, checkbox, component, div, dock, export_view, h_flex, input,
+        nested, text, v_flex,
     };
 }
 
@@ -205,6 +206,38 @@ impl<V: 'static> Cx<V> {
         .to_string();
         unsafe { host::push_toast(toast.as_ptr() as u32, toast.len() as u32) }
     }
+}
+
+/// A dock area: panels docked left, right, bottom and center, which the user
+/// can drag and resize — a script's `DockArea`. Created from `init` or a
+/// handler, drawn with [`dock`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Dock(u64);
+
+impl Dock {
+    pub fn new(id: &str) -> Self {
+        Self(unsafe { host::dock_new(id.as_ptr() as u32, id.len() as u32) })
+    }
+
+    /// Docks `part` as a panel named `name` at `placement` (`"left"`,
+    /// `"right"`, `"bottom"` or `"center"`).
+    pub fn add_panel(&self, part: Part, name: &str, placement: &str) {
+        unsafe {
+            host::dock_add_panel(
+                self.0,
+                part.0,
+                name.as_ptr() as u32,
+                name.len() as u32,
+                placement.as_ptr() as u32,
+                placement.len() as u32,
+            )
+        }
+    }
+}
+
+/// Draws a dock area.
+pub fn dock(dock: &Dock) -> Element {
+    element(Component::Dock(dock.0))
 }
 
 /// A part drawn in place, with its own invalidation: a script's child view.
@@ -925,6 +958,15 @@ mod host {
         pub fn input_set_value(handle: u32, ptr: u32, len: u32);
         pub fn input_on_submit(handle: u32, callback: u32);
         pub fn log(ptr: u32, len: u32);
+        pub fn dock_new(id_ptr: u32, id_len: u32) -> u64;
+        pub fn dock_add_panel(
+            dock: u64,
+            part: u32,
+            name_ptr: u32,
+            name_len: u32,
+            placement_ptr: u32,
+            placement_len: u32,
+        );
         pub fn process_spawn(request_ptr: u32, request_len: u32, callback: u32) -> u32;
         pub fn socket_open(url_ptr: u32, url_len: u32, callback: u32) -> u32;
         pub fn socket_send(id: u32, text_ptr: u32, text_len: u32);
@@ -990,6 +1032,12 @@ mod host {
         unimplemented!("gpui-shell host imports exist only in a wasm32 guest")
     }
     pub unsafe fn log(_: u32, _: u32) {}
+    pub unsafe fn dock_new(_: u32, _: u32) -> u64 {
+        unimplemented!("gpui-shell host imports exist only in a wasm32 guest")
+    }
+    pub unsafe fn dock_add_panel(_: u64, _: u32, _: u32, _: u32, _: u32, _: u32) {
+        unimplemented!("gpui-shell host imports exist only in a wasm32 guest")
+    }
     pub unsafe fn process_spawn(_: u32, _: u32, _: u32) -> u32 {
         unimplemented!("gpui-shell host imports exist only in a wasm32 guest")
     }
