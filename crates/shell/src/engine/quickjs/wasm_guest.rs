@@ -18,13 +18,14 @@
 //!
 //! * Guest instances live in a thread-local registry and are never released
 //!   when their application generation retires (a reload leaks one).
-//! * Only the `gpui-base` element set is reachable; registered
-//!   `gpui-component` components, state styles, slots, async and the
+//! * The `gpui-base` element set and stateless registered components
+//!   (constructors and methods, element and handler arguments) are
+//!   reachable; registered retained state, state styles, slots, async and the
 //!   capability-gated host APIs (fs, storage, network) have no import yet.
-//! * Descriptions and events cross as JSON; nothing has been measured.
-//! * The `gpui-shell run/check` CLI resolves a fixed `main.js` entry, so a
-//!   `.wasm` entry is reached through `ShellRuntime::load` (the manifest path)
-//!   rather than the CLI.
+//! * Registered component arguments are not validated against their schema
+//!   before the adapter decodes them, as a script's are.
+//! * Descriptions cross as postcard; handler payloads as JSON. The grid test
+//!   below times the guest beside the script.
 
 use std::{
     cell::RefCell,
@@ -136,24 +137,67 @@ fn record(
     description: &Description,
 ) -> JsResult<SpecId> {
     let fail = |message: String| js_error::type_error(ctx, &message);
-    let ids: Vec<SpecId> = description
-        .nodes
-        .iter()
-        .map(|node| runtime.push_component(component(&node.component)))
-        .collect();
+    // Nodes arrive after everything they refer to, so each one is finished —
+    // constructed, its calls recorded, its children attached — before the
+    // next, exactly the order a script's builder chain records in.
+    let mut ids: Vec<SpecId> = Vec::with_capacity(description.nodes.len());
 
-    for (node, &id) in description.nodes.iter().zip(&ids) {
+    for node in &description.nodes {
+        let id = match &node.component {
+            abi::Component::Registered { export, args } => {
+                let (component_id, name, constructor) = runtime
+                    .components
+                    .registered()
+                    .find_map(|(component_id, descriptor)| {
+                        descriptor
+                            .constructors()
+                            .iter()
+                            .find(|constructor| constructor.export() == export)
+                            .map(|constructor| {
+                                (component_id, descriptor.name(), constructor.clone())
+                            })
+                    })
+                    .ok_or_else(|| fail(format!("no registered component exports `{export}`")))?;
+                let arguments = component_arguments(ctx, runtime, guest, &ids, args)?;
+                let payload = constructor
+                    .payload(&arguments)
+                    .map_err(|error| fail(format!("{export}(...): {error}")))?;
+                runtime.push_component(Component::Registered(
+                    crate::spec::RegisteredComponentSpec::new(component_id, name, payload),
+                ))
+            }
+            other => runtime.push_component(component(other)),
+        };
+        ids.push(id);
+
         for op in &node.ops {
             let op = match op {
                 Op::Style(name) => SpecOp::NullaryStyle(
                     crate::style::nullary_index(name)
                         .ok_or_else(|| fail(format!("unknown style `{name}`")))?,
                 ),
-                Op::ParamStyle(name, args) => SpecOp::ParamStyle(
-                    crate::style::param_style_name(name)
-                        .ok_or_else(|| fail(format!("unknown style `{name}`")))?,
-                    bridged(args),
-                ),
+                Op::ParamStyle(name, args) => {
+                    let name = crate::style::param_style_name(name)
+                        .ok_or_else(|| fail(format!("unknown style `{name}`")))?;
+                    let mut args = bridged(args);
+                    // A script reads a color as `cx.theme().colors.primary`; a
+                    // guest names the token instead, resolved here against the
+                    // theme the build synced.
+                    if COLOR_STYLES.contains(&name) {
+                        for arg in &mut args {
+                            if let Bridged::Str(value) = arg
+                                && !value.starts_with('#')
+                            {
+                                let color =
+                                    crate::theme_tokens::token_color(value).ok_or_else(|| {
+                                        fail(format!("unknown color token `{value}`"))
+                                    })?;
+                                *value = hex(color);
+                            }
+                        }
+                    }
+                    SpecOp::ParamStyle(name, args)
+                }
                 Op::Method(name, args) => SpecOp::Method(intern(name), bridged(args)),
                 Op::Callback(name, callback) => {
                     let name = match name.as_str() {
@@ -162,6 +206,19 @@ fn record(
                         other => return Err(fail(format!("unsupported handler `{other}`"))),
                     };
                     SpecOp::Callback(name, register(ctx, runtime, guest, *callback)?)
+                }
+                Op::Component(name, args) => {
+                    let method = runtime
+                        .registered_method_descriptor(id, name)
+                        .ok_or_else(|| fail(format!("the component has no method `{name}`")))?;
+                    let arguments = component_arguments(ctx, runtime, guest, &ids, args)?;
+                    let payload = method
+                        .record(&arguments)
+                        .map_err(|error| fail(format!("{name}(...): {error}")))?;
+                    SpecOp::RegisteredMethod(crate::RecordedComponentMethod::new(
+                        method.name(),
+                        payload,
+                    ))
                 }
             };
             runtime
@@ -185,6 +242,68 @@ fn record(
         .ok_or_else(|| fail("the description has no root".to_owned()))
 }
 
+/// Converts a guest's component arguments: an element index becomes the
+/// recorded node, claimed so it is rendered by the component rather than as
+/// a child; a handler becomes an entry in the open callback generation.
+fn component_arguments(
+    ctx: &Ctx<'_>,
+    runtime: &Rc<ShellRuntime>,
+    guest: &Rc<Guest>,
+    ids: &[SpecId],
+    args: &[abi::ComponentArg],
+) -> JsResult<Vec<crate::ComponentArgument>> {
+    use crate::ComponentArgument as Argument;
+    let fail = |message: String| js_error::type_error(ctx, &message);
+    args.iter()
+        .map(|arg| {
+            Ok(match arg {
+                abi::ComponentArg::String(value) => Argument::String(value.clone()),
+                abi::ComponentArg::Number(value) => Argument::Number(*value),
+                abi::ComponentArg::Boolean(value) => Argument::Boolean(*value),
+                abi::ComponentArg::Enum(value) => Argument::Enum(value.clone()),
+                abi::ComponentArg::Element(index) => {
+                    let element = *ids.get(*index as usize).ok_or_else(|| {
+                        fail(format!("element argument {index} comes after its user"))
+                    })?;
+                    runtime
+                        .arena_mut()
+                        .claim(element)
+                        .map_err(|error| fail(error.to_string()))?;
+                    Argument::Element(element)
+                }
+                abi::ComponentArg::Callback(callback) => {
+                    Argument::Callback(register(ctx, runtime, guest, *callback)?)
+                }
+                abi::ComponentArg::Array(values) => {
+                    Argument::Array(component_arguments(ctx, runtime, guest, ids, values)?)
+                }
+                abi::ComponentArg::Optional(value) => Argument::Optional(match value {
+                    Some(value) => Some(Box::new(
+                        component_arguments(ctx, runtime, guest, ids, std::slice::from_ref(value))?
+                            .remove(0),
+                    )),
+                    None => None,
+                }),
+            })
+        })
+        .collect()
+}
+
+/// The style methods whose string argument is a color.
+const COLOR_STYLES: &[&str] = &["bg", "text_color", "text_bg", "border_color"];
+
+fn hex(color: gpui::Hsla) -> String {
+    let rgba = color.to_rgb();
+    let channel = |value: f32| (value.clamp(0., 1.) * 255.).round() as u8;
+    format!(
+        "#{:02x}{:02x}{:02x}{:02x}",
+        channel(rgba.r),
+        channel(rgba.g),
+        channel(rgba.b),
+        channel(rgba.a)
+    )
+}
+
 fn component(component: &abi::Component) -> Component {
     match component {
         abi::Component::Div => Component::Div,
@@ -194,6 +313,7 @@ fn component(component: &abi::Component) -> Component {
         abi::Component::Button(id) => Component::Button(id.clone()),
         abi::Component::Checkbox(id) => Component::Checkbox(id.clone()),
         abi::Component::Input(handle) => Component::Input(EntityHandle::from(*handle)),
+        abi::Component::Registered { .. } => unreachable!("recorded by `record`"),
     }
 }
 
@@ -360,7 +480,7 @@ impl Guest {
             .call(&mut *store, ())
             .map_err(|error| anyhow!("guest render failed: {error:#}"))?;
         let bytes = read(&self.memory, &*store, packed)?;
-        serde_json::from_slice(&bytes).context("guest returned a malformed description")
+        postcard::from_bytes(&bytes).context("guest returned a malformed description")
     }
 
     /// Runs guest handler `callback`. Returns whether it asked to re-render.
@@ -523,14 +643,15 @@ fn link_imports(linker: &mut Linker<HostState>) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+// The guests use `gpui-component`'s catalog, so the tests need it.
+#[cfg(all(test, feature = "components"))]
 mod tests {
     //! Drives the `examples/wasm_todolist` guest through the plugin load path
     //! and the host's own dispatch entry points.
 
     use std::{ops::Deref as _, path::PathBuf, process::Command};
 
-    use gpui::{ClickEvent, TestAppContext, VisualTestContext};
+    use gpui::{ClickEvent, IntoElement as _, TestAppContext, VisualTestContext};
     use gpui_base::input::InputEvent;
 
     use super::*;
@@ -539,17 +660,23 @@ mod tests {
     /// Builds the example guest and returns the module's path. The test builds
     /// it rather than reading a checked-in binary, so the guest and the host it
     /// is tested against cannot drift apart.
-    fn build_guest() -> PathBuf {
-        let example =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/wasm_todolist");
+    fn build_guest(example: &str) -> PathBuf {
+        let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples")
+            .join(example);
         let status = Command::new(env!("CARGO"))
             .args(["build", "--release", "--target", "wasm32-unknown-unknown"])
             .arg("--manifest-path")
-            .arg(example.join("Cargo.toml"))
+            .arg(directory.join("Cargo.toml"))
             .status()
             .expect("run cargo for the guest");
-        assert!(status.success(), "the example guest failed to build");
-        example.join("target/wasm32-unknown-unknown/release/wasm_todolist.wasm")
+        assert!(
+            status.success(),
+            "the example guest {example} failed to build"
+        );
+        directory
+            .join("target/wasm32-unknown-unknown/release")
+            .join(format!("{example}.wasm"))
     }
 
     /// An application directory holding the guest and a manifest naming it.
@@ -563,7 +690,7 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&directory).unwrap();
-        std::fs::copy(build_guest(), directory.join("todo.wasm")).unwrap();
+        std::fs::copy(build_guest("wasm_todolist"), directory.join("todo.wasm")).unwrap();
         std::fs::write(
             directory.join(MANIFEST_FILE),
             r#"{"id": "dev.test.wasm-todolist", "name": "Wasm Todo", "entry": "todo.wasm"}"#,
@@ -592,9 +719,13 @@ mod tests {
 
     impl Harness {
         fn load(cx: &mut TestAppContext) -> Self {
-            cx.update(crate::init);
             let directory = application();
-            let runtime = cx.update(ShellRuntime::new).expect("runtime");
+            // The runtime the shipped command builds: with the catalog.
+            let components = crate::components::components().expect("catalog");
+            cx.update(|cx| crate::init_with_components(cx, &components));
+            let runtime = cx
+                .update(|cx| ShellRuntime::new_with_components(cx, components))
+                .expect("runtime");
             let window = cx.add_window(|_, _| gpui::Empty);
             let mut context = VisualTestContext::from_window(*window.deref(), cx);
             let root = context
@@ -684,6 +815,27 @@ mod tests {
 
         fn click(&mut self, element: &str) {
             let callback = self.handler(element, "on_click");
+            self.dispatch_click(callback);
+        }
+
+        /// Clicks the only registered component named `name` (its element id
+        /// lives inside the adapter's payload, not in the description).
+        fn click_registered(&mut self, name: &str) {
+            let name = name.to_owned();
+            let callback = self.find(move |node| {
+                match node.component()? {
+                    Component::Registered(spec) if spec.name() == name => {}
+                    _ => return None,
+                }
+                node.ops().iter().find_map(|op| match op {
+                    SpecOp::Callback("on_click", callback) => Some(*callback),
+                    _ => None,
+                })
+            });
+            self.dispatch_click(callback);
+        }
+
+        fn dispatch_click(&mut self, callback: crate::spec::CallbackId) {
             let runtime = self.runtime.clone();
             self.context.update(|window, cx| {
                 runtime.dispatch_click(callback, &ClickEvent::default(), window, cx)
@@ -697,12 +849,22 @@ mod tests {
         let mut app = Harness::load(cx);
         let tree = app.tree();
         assert!(tree.contains("Nothing yet"), "{tree}");
-        assert!(tree.contains("Button \"add\""), "{tree}");
+        // Registered `gpui-component` components, with their methods recorded
+        // by the catalog's own descriptors.
+        assert!(
+            tree.contains("Button :label(registered) :primary(registered) :on_click(fn)"),
+            "{tree}"
+        );
+        assert!(tree.contains("Tag :variant(registered)"), "{tree}");
+        assert!(tree.contains("Progress :value(registered)"), "{tree}");
+        // Color tokens arrive as theme colors, which is all materialize takes.
+        assert!(tree.contains(".bg[Str(\"#"), "{tree}");
+        assert!(!tree.contains("Str(\"primary\")"), "{tree}");
 
         // Add: the guest reads the input through a host import, appends a
         // row, clears the input through another, and asks for a re-render.
         app.type_text("Write the spike");
-        app.click("add");
+        app.click_registered("Button");
         let tree = app.tree();
         assert!(tree.contains("Write the spike"), "{tree}");
         assert!(tree.contains("1 of 1 remaining"), "{tree}");
@@ -747,5 +909,156 @@ mod tests {
         let tree = app.tree();
         assert!(!tree.contains("Write the spike"), "{tree}");
         assert!(tree.contains("1 of 1 remaining"), "{tree}");
+    }
+
+    /// `tests/benchmark.rs`'s grid, verbatim at 40 x 5.
+    const SCRIPT_GRID: &str = r#"
+import { View, div } from "gpui-kit";
+import { v_flex, h_flex, Button } from "gpui-base";
+
+export default class Grid extends View {
+  init() { this.rows = 40; this.columns = 5; }
+  cell(row, column) {
+    return div().flex().items_center().justify_center().w(90).h(24).px(6).rounded(4)
+      .bg(`#f8f8f8`).text_color(`#111111`).text_sm().child(`${row}:${column}`);
+  }
+  row(row) {
+    const cells = [];
+    for (let column = 0; column < this.columns; column += 1) cells.push(this.cell(row, column));
+    return h_flex().gap(6).py(2).children(cells);
+  }
+  render(cx) {
+    const rows = [];
+    for (let row = 0; row < this.rows; row += 1) rows.push(this.row(row));
+    return v_flex().size_full().p(12).gap(4).bg(`#ffffff`).children(rows)
+      .child(Button.new("refresh").px(10).py(4).rounded(6).bg(`#2563eb`).child("Refresh"));
+  }
+}
+"#;
+
+    const ROUNDS: usize = 7;
+    const ITERATIONS: usize = 50;
+
+    /// Best of `ROUNDS` batches, as `tests/benchmark.rs` times its [A].
+    fn best_per_call(mut body: impl FnMut()) -> std::time::Duration {
+        let mut best = std::time::Duration::MAX;
+        for _ in 0..ROUNDS {
+            let started = std::time::Instant::now();
+            for _ in 0..ITERATIONS {
+                body();
+            }
+            best = best.min(started.elapsed() / ITERATIONS as u32);
+        }
+        best
+    }
+
+    /// The wasm guest's description cost next to the script's, under the same
+    /// harness and in the same process. Meaningful only in a release build:
+    ///
+    /// ```text
+    /// cargo test -p gpui-shell --release --no-default-features \
+    ///     --features quickjs,components,wasm-guest --lib wasm_guest -- --nocapture
+    /// ```
+    #[gpui::test]
+    fn the_grid_guest_describes_the_script_grid_and_is_timed_beside_it(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let directory = std::env::temp_dir().join(format!(
+            "gpui-shell-wasm-grid-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let module = build_guest("wasm_grid");
+        std::fs::copy(&module, directory.join("grid.wasm")).unwrap();
+        let module_bytes = std::fs::metadata(&module).unwrap().len();
+
+        let runtime = ShellRuntime::new_isolated().expect("runtime");
+        cx.update(|cx| runtime.set_global(cx));
+        let window = cx.add_window(|_, _| gpui::Empty);
+        let mut context = VisualTestContext::from_window(*window.deref(), cx);
+
+        let guest_type = runtime
+            .load_app(&directory, "grid.wasm")
+            .expect("load guest");
+        let script_type = runtime
+            .load_source("script-grid", SCRIPT_GRID)
+            .expect("load script");
+        let guest = context
+            .update(|window, cx| runtime.instantiate(&guest_type, window, cx))
+            .expect("instantiate guest");
+        let script = context
+            .update(|window, cx| runtime.instantiate(&script_type, window, cx))
+            .expect("instantiate script");
+
+        let build = |context: &mut VisualTestContext, object: &crate::engine::ViewObject| {
+            context.update(|window, cx| {
+                runtime
+                    .build_snapshot(object, None, crate::policy::default(), window, cx)
+                    .expect("render")
+            })
+        };
+
+        // The same work, or the comparison means nothing.
+        let guest_snapshot = build(&mut context, &guest);
+        let script_snapshot = build(&mut context, &script);
+        assert_eq!(guest_snapshot.debug_tree(), script_snapshot.debug_tree());
+        let nodes = guest_snapshot.len();
+
+        let time = |context: &mut VisualTestContext, object: &crate::engine::ViewObject| {
+            context.update(|window, cx| {
+                best_per_call(|| {
+                    runtime
+                        .build_snapshot(object, None, crate::policy::default(), window, cx)
+                        .expect("render");
+                })
+            })
+        };
+        let script_build = time(&mut context, &script);
+        let guest_build = time(&mut context, &guest);
+
+        // The guest's own share: running the module and decoding its JSON.
+        let instance = REGISTRY.with(|registry| registry.borrow().guests.last().cloned().unwrap());
+        let mut bytes = 0;
+        let guest_only = best_per_call(|| {
+            let description = instance.render().expect("render");
+            bytes = postcard::to_allocvec(&description).unwrap().len();
+        });
+
+        let materialize = |context: &mut VisualTestContext, snapshot: &RenderSnapshot| {
+            let mut elapsed = std::time::Duration::MAX;
+            context.draw(
+                gpui::Point::default(),
+                gpui::size(gpui::px(800.), gpui::px(600.)),
+                |window, cx| {
+                    elapsed = best_per_call(|| {
+                        std::hint::black_box(crate::materialize::materialize(
+                            &runtime, snapshot, window, cx,
+                        ));
+                    });
+                    gpui::div().into_any_element()
+                },
+            );
+            elapsed
+        };
+        let guest_materialize = materialize(&mut context, &guest_snapshot);
+        let script_materialize = materialize(&mut context, &script_snapshot);
+
+        let ms = |duration: std::time::Duration| duration.as_secs_f64() * 1000.0;
+        println!(
+            "\n[wasm guest vs script] {nodes} nodes (40x5), module {module_bytes} bytes, \
+             description {bytes} bytes encoded\n\
+             [A] describe:    script {:.3} ms, guest {:.3} ms \
+             (guest module + decode {:.3} ms, record {:.3} ms)\n\
+             [B] materialize: script {:.3} ms, guest {:.3} ms",
+            ms(script_build),
+            ms(guest_build),
+            ms(guest_only),
+            ms(guest_build.saturating_sub(guest_only)),
+            ms(script_materialize),
+            ms(guest_materialize),
+        );
     }
 }

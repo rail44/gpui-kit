@@ -29,14 +29,14 @@
 
 use std::rc::Rc;
 
-use abi::{Arg, Component, Description, Node, Op};
+use abi::{Arg, Component, ComponentArg, Description, Node, Op};
 pub use gpui_shell_wasm_abi as abi;
 use serde_json::Value;
 
 pub mod prelude {
     pub use crate::{
-        Cx, Element, Event, Handler, InputState, View, button, checkbox, div, export_view, h_flex,
-        input, text, v_flex,
+        CArg, Cx, Element, Event, Handler, InputState, View, button, checkbox, component, div,
+        export_view, h_flex, input, text, v_flex,
     };
 }
 
@@ -110,14 +110,82 @@ impl<V: 'static> Cx<V> {
 
 /// One element under construction.
 pub struct Element {
-    component: Component,
-    ops: Vec<Op>,
+    kind: Kind,
+    ops: Vec<PendingOp>,
     children: Vec<Element>,
+}
+
+enum Kind {
+    Base(Component),
+    Registered { export: String, args: Vec<CArg> },
+}
+
+enum PendingOp {
+    Op(Op),
+    Component(String, Vec<CArg>),
+}
+
+/// An argument to a registered component, before the tree is flattened:
+/// an element argument is still an [`Element`] here.
+pub enum CArg {
+    String(String),
+    Number(f64),
+    Boolean(bool),
+    Enum(String),
+    Element(Element),
+    Handler(Handler),
+    Array(Vec<CArg>),
+    Optional(Option<Box<CArg>>),
+}
+
+impl From<&str> for CArg {
+    fn from(value: &str) -> Self {
+        CArg::String(value.to_owned())
+    }
+}
+impl From<String> for CArg {
+    fn from(value: String) -> Self {
+        CArg::String(value)
+    }
+}
+impl From<f64> for CArg {
+    fn from(value: f64) -> Self {
+        CArg::Number(value)
+    }
+}
+impl From<bool> for CArg {
+    fn from(value: bool) -> Self {
+        CArg::Boolean(value)
+    }
+}
+impl From<Handler> for CArg {
+    fn from(value: Handler) -> Self {
+        CArg::Handler(value)
+    }
+}
+impl From<Element> for CArg {
+    fn from(value: Element) -> Self {
+        CArg::Element(value)
+    }
 }
 
 fn element(component: Component) -> Element {
     Element {
-        component,
+        kind: Kind::Base(component),
+        ops: Vec::new(),
+        children: Vec::new(),
+    }
+}
+
+/// A component the host's catalog registered, by its constructor's export
+/// name: `component("Button", ["add".into()])` is a script's
+/// `Button.new("add")` from `"gpui-component"`.
+pub fn component(export: &str, args: impl IntoIterator<Item = CArg>) -> Element {
+    Element {
+        kind: Kind::Registered {
+            export: export.to_owned(),
+            args: args.into_iter().collect(),
+        },
         ops: Vec::new(),
         children: Vec::new(),
     }
@@ -156,14 +224,26 @@ pub fn input(state: &InputState) -> Element {
 impl Element {
     /// A no-argument style method by name (`"size_full"`, `"items_center"`).
     pub fn style(mut self, name: &str) -> Self {
-        self.ops.push(Op::Style(name.to_owned()));
+        self.ops.push(PendingOp::Op(Op::Style(name.to_owned())));
         self
     }
 
     /// A style method with arguments by name (`"gap"`, `"bg"`).
     pub fn style_with(mut self, name: &str, args: impl IntoIterator<Item = Arg>) -> Self {
-        self.ops
-            .push(Op::ParamStyle(name.to_owned(), args.into_iter().collect()));
+        self.ops.push(PendingOp::Op(Op::ParamStyle(
+            name.to_owned(),
+            args.into_iter().collect(),
+        )));
+        self
+    }
+
+    /// A method the registered component declares (`label`, `primary`,
+    /// `value`): `.call("label", ["Add".into()])`.
+    pub fn call(mut self, name: &str, args: impl IntoIterator<Item = CArg>) -> Self {
+        self.ops.push(PendingOp::Component(
+            name.to_owned(),
+            args.into_iter().collect(),
+        ));
         self
     }
 
@@ -230,8 +310,10 @@ impl Element {
 
     /// A behavior method by name (`"checked"`, `"disabled"`).
     pub fn method(mut self, name: &str, args: impl IntoIterator<Item = Arg>) -> Self {
-        self.ops
-            .push(Op::Method(name.to_owned(), args.into_iter().collect()));
+        self.ops.push(PendingOp::Op(Op::Method(
+            name.to_owned(),
+            args.into_iter().collect(),
+        )));
         self
     }
     pub fn checked(self, checked: bool) -> Self {
@@ -239,14 +321,18 @@ impl Element {
     }
 
     pub fn on_click(mut self, handler: Handler) -> Self {
-        self.ops
-            .push(Op::Callback("on_click".to_owned(), handler.0));
+        self.ops.push(PendingOp::Op(Op::Callback(
+            "on_click".to_owned(),
+            handler.0,
+        )));
         self
     }
     /// A checkbox's toggle; the [`Event`] carries the requested state.
     pub fn on_change(mut self, handler: Handler) -> Self {
-        self.ops
-            .push(Op::Callback("on_change".to_owned(), handler.0));
+        self.ops.push(PendingOp::Op(Op::Callback(
+            "on_change".to_owned(),
+            handler.0,
+        )));
         self
     }
 
@@ -261,15 +347,54 @@ impl Element {
 
     /// Flattens the tree into the description the host records.
     pub fn into_description(self) -> Description {
+        // Post-order: children and element arguments land before the node
+        // that refers to them, which is the order the host records in.
+        fn argument(arg: CArg, nodes: &mut Vec<Node>) -> ComponentArg {
+            match arg {
+                CArg::String(value) => ComponentArg::String(value),
+                CArg::Number(value) => ComponentArg::Number(value),
+                CArg::Boolean(value) => ComponentArg::Boolean(value),
+                CArg::Enum(value) => ComponentArg::Enum(value),
+                CArg::Element(element) => ComponentArg::Element(flatten(element, nodes)),
+                CArg::Handler(handler) => ComponentArg::Callback(handler.0),
+                CArg::Array(values) => ComponentArg::Array(
+                    values
+                        .into_iter()
+                        .map(|value| argument(value, nodes))
+                        .collect(),
+                ),
+                CArg::Optional(value) => {
+                    ComponentArg::Optional(value.map(|value| Box::new(argument(*value, nodes))))
+                }
+            }
+        }
         fn flatten(element: Element, nodes: &mut Vec<Node>) -> u32 {
+            let component = match element.kind {
+                Kind::Base(component) => component,
+                Kind::Registered { export, args } => Component::Registered {
+                    export,
+                    args: args.into_iter().map(|arg| argument(arg, nodes)).collect(),
+                },
+            };
+            let ops = element
+                .ops
+                .into_iter()
+                .map(|op| match op {
+                    PendingOp::Op(op) => op,
+                    PendingOp::Component(name, args) => Op::Component(
+                        name,
+                        args.into_iter().map(|arg| argument(arg, nodes)).collect(),
+                    ),
+                })
+                .collect();
             let children = element
                 .children
                 .into_iter()
                 .map(|child| flatten(child, nodes))
                 .collect();
             nodes.push(Node {
-                component: element.component,
-                ops: element.ops,
+                component,
+                ops,
                 children,
             });
             nodes.len() as u32 - 1
@@ -385,7 +510,7 @@ impl<V: View> Guest<V> {
         self.cx.rendering = true;
         let element = view.render(&mut self.cx);
         self.cx.rendering = false;
-        self.last = serde_json::to_vec(&element.into_description()).unwrap_or_default();
+        self.last = postcard::to_allocvec(&element.into_description()).unwrap_or_default();
         abi::pack(self.last.as_ptr() as u32, self.last.len() as u32)
     }
 
@@ -493,7 +618,7 @@ mod tests {
         let mut guest = Guest::<Counter>::default();
         guest.init();
         guest.render();
-        let description: Description = serde_json::from_slice(&guest.last).unwrap();
+        let description: Description = postcard::from_bytes(&guest.last).unwrap();
         let root = &description.nodes[description.root as usize];
         assert_eq!(root.ops, [Op::Callback("on_click".into(), 0)]);
         assert_eq!(guest.dispatch(0, b"null".to_vec()), 1);

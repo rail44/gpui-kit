@@ -51,6 +51,14 @@ impl TodoList {
         self.draft.set_value("");
     }
 
+    fn percent_done(&self) -> f64 {
+        if self.items.is_empty() {
+            return 0.;
+        }
+        let done = self.items.len() - self.remaining();
+        done as f64 * 100. / self.items.len() as f64
+    }
+
     fn remaining(&self) -> usize {
         self.items.iter().filter(|item| !item.done).count()
     }
@@ -168,19 +176,35 @@ impl View for TodoList {
                 h_flex()
                     .items_center()
                     .justify_between()
-                    .child(text("Todo").text_size(18.))
-                    .child(text(summary).text_color("muted_foreground")),
+                    // Text has no box of its own; style the element around it.
+                    .child(div().text_size(18.).child(text("Todo")))
+                    // A registered `gpui-component` Tag, as a script's
+                    // `Tag.new().variant("secondary")`.
+                    .child(
+                        component("Tag", [])
+                            .call("variant", [CArg::Enum("secondary".into())])
+                            .child(text(summary)),
+                    ),
             )
             .child(
                 h_flex()
                     .gap(8.)
                     .child(div().flex_1().child(input(&self.draft)))
-                    .child(primary_button("add".into(), "Add").on_click(cx.listener(
-                        |this, _, cx| {
-                            this.add();
-                            cx.notify();
-                        },
-                    ))),
+                    // `gpui-component`'s Button rather than the unstyled base
+                    // one: its look comes from the catalog.
+                    .child(
+                        component("Button", ["add".into()])
+                            .call("label", ["Add".into()])
+                            .call("primary", [])
+                            .on_click(cx.listener(|this, _, cx| {
+                                this.add();
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                component("Progress", ["done-progress".into()])
+                    .call("value", [self.percent_done().into()]),
             )
             .child(
                 h_flex()

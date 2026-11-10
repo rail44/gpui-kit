@@ -26,7 +26,8 @@ pub mod export {
     /// `init`, so retained state may be created here.
     pub const INIT: &str = "gpui_shell_init";
     /// `fn() -> u64`: describes one render; returns a packed buffer holding a
-    /// JSON-encoded [`super::Description`].
+    /// postcard-encoded [`super::Description`]. (Handler payloads stay JSON:
+    /// they are small, and a click's shape is the host's to choose.)
     pub const RENDER: &str = "gpui_shell_render";
     /// `fn(callback: u32, event_ptr: u32, event_len: u32) -> u32`: runs one
     /// handler with a JSON-encoded event payload. Returns 1 when the handler
@@ -91,6 +92,28 @@ pub enum Component {
     Checkbox(String),
     /// A retained input, by the handle `input_new` returned.
     Input(u32),
+    /// A component the host's catalog registered (`gpui-component`'s
+    /// `Button`, `Tag`, `Progress`, ...), by its constructor's export name.
+    Registered {
+        export: String,
+        args: Vec<ComponentArg>,
+    },
+}
+
+/// An argument to a registered component's constructor or method, mirroring
+/// gpui-shell's `ComponentArgument`. Elements and handlers are passed by
+/// number: an element is a node index that must come before the node using
+/// it, a handler is the guest's callback id.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum ComponentArg {
+    String(String),
+    Number(f64),
+    Boolean(bool),
+    Enum(String),
+    Element(u32),
+    Callback(u32),
+    Array(Vec<ComponentArg>),
+    Optional(Option<Box<ComponentArg>>),
 }
 
 /// One call recorded on an element.
@@ -104,6 +127,9 @@ pub enum Op {
     Method(String, Vec<Arg>),
     /// An event handler (`on_click`, `on_change`) and the guest's callback id.
     Callback(String, u32),
+    /// A method a registered component declares (`label`, `primary`,
+    /// `value`, ...).
+    Component(String, Vec<ComponentArg>),
 }
 
 /// An argument value, matching gpui-shell's neutral `Bridged` value.

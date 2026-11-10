@@ -5092,6 +5092,7 @@ dependencies = [
  "instant",
  "lb-wry",
  "libc",
+ "postcard",
  "quickjs-jit",
  "quickjs-jit-runtime",
  "quickjs-jit-stdlib",
@@ -5123,6 +5124,7 @@ name = "gpui-shell-wasm-guest"
 version = "0.9.0"
 dependencies = [
  "gpui-shell-wasm-abi",
+ "postcard",
  "serde_json",
 ]
 

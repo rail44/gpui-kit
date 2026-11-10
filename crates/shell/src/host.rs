@@ -935,7 +935,7 @@ fn check(
                 }
             };
 
-            let root = match crate::resolve_app_root(&directory, ENTRY) {
+            let root = match manifest_or_entry_root(&directory) {
                 Ok(root) => root,
                 Err(error) => {
                     outcome.fail(format!("{error:#}"));
@@ -1150,6 +1150,19 @@ fn install_palette(cx: &mut App) {
 }
 
 /// Reads and validates inert application metadata before any entry code runs.
+/// The application root for `check`: the directory holding `main.js`, or one
+/// holding a manifest, whose `entry` the load reads instead (it may name
+/// another script or, with `wasm-guest`, a WebAssembly guest).
+fn manifest_or_entry_root(directory: &Path) -> anyhow::Result<PathBuf> {
+    match crate::resolve_app_root(directory, ENTRY) {
+        Ok(root) => Ok(root),
+        Err(_) if directory.join(crate::plugin::MANIFEST_FILE).is_file() => {
+            Ok(directory.canonicalize()?)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn read_local_manifest(root: &Path) -> Result<Option<crate::plugin::PluginManifest>, String> {
     let path = root.join(crate::plugin::MANIFEST_FILE);
     if !path.exists() {
