@@ -92,11 +92,12 @@
 //!
 //! It is a **dependency isolation layer**, and calling it a replaceable-engine
 //! contract would be flattering it. `ShellRuntime`, `ViewObject` and `ViewType`
-//! are re-exports of QuickJS types, not associated types behind a trait; adding
-//! a second engine would mean editing this file, matching a structural surface
-//! nothing checks, and discovering by compile error which of the two dozen
-//! entry points above it had missed. That is a port, not an implementation of a
-//! contract.
+//! are re-exports of the active engine's types, not associated types behind a
+//! trait. The second engine (`wasm`, behind `wasm-engine`) was added exactly
+//! that way: a port matching a structural surface nothing checks, found by
+//! compile error. What it shares with QuickJS without copying lives here too:
+//! `component_host` (registered component state and app effects), and above
+//! the seam `crate::net` (the network services).
 //!
 //! What the isolation does buy is real, and is the reason to keep it:
 //!
@@ -113,10 +114,9 @@
 //!   is the only entry into script `render`, and benchmark C fails if a repaint
 //!   ever reaches it.
 //!
-//! Making it an actual contract — an internal trait with associated opaque
-//! handles, and a minimal fake engine to compile the contract against — is worth
-//! doing when there is a second engine to write, and is make-work before that.
-//! The honest description today is the one above.
+//! Making it an actual contract (an internal trait with associated opaque
+//! handles) is the next step now that there are two engines to hold to it;
+//! until then the description above is the honest one.
 //!
 //! # Why the engine was worth isolating at all
 //!
@@ -125,31 +125,52 @@
 //! whether the whole approach is viable (see `docs/gpui-shell.md` §20). QuickJS
 //! is what ships, because application code reads better in JavaScript.
 
-#[cfg(not(feature = "quickjs"))]
-compile_error!("enable a scripting engine: `quickjs` is the default and the only one today");
+#[cfg(not(any(feature = "quickjs", feature = "wasm-engine")))]
+compile_error!("enable an engine: `quickjs` (the default) or `wasm-engine`");
+#[cfg(all(feature = "quickjs", feature = "wasm-engine"))]
+compile_error!("`quickjs` and `wasm-engine` are exclusive; build with --no-default-features");
+
+pub(crate) mod component_host;
 
 #[cfg(feature = "quickjs")]
 pub(crate) mod quickjs;
+#[cfg(feature = "quickjs")]
+use quickjs as active;
+
+#[cfg(feature = "wasm-engine")]
+pub(crate) mod wasm;
+#[cfg(feature = "wasm-engine")]
+use wasm as active;
+
 /// Only `dock`'s tests name it; every other caller passes it straight from
 /// `load_app` into `instantiate` without spelling the type.
+#[cfg(all(test, feature = "quickjs"))]
+pub(crate) use active::ViewType;
+/// The names each built-in module exports, for the generated agent notes.
+pub(crate) use active::exports;
 #[cfg(test)]
-pub(crate) use quickjs::ViewType;
-#[cfg(feature = "quickjs")]
-pub use quickjs::{LoadedApplication, ShellRuntime, ViewObject};
+pub(crate) use active::task_count;
+pub use active::{LoadedApplication, ShellRuntime, ViewObject};
+/// Where the work an application started is stopped: by view, by application
+/// generation, or by the policy it ran under. Above the seam, because a view,
+/// a root and a plugin host each own one of those boundaries.
+pub(crate) use active::{cancel_application_tasks, cancel_policy_tasks, cancel_view_tasks};
 
 /// Points the script-visible store at its backing file.
 ///
 /// Part of the contract rather than something the crate root reaches into an
 /// engine for. There is deliberately no fallback: an engine that cannot honour
-/// this does not compile, because the alternative — the one this replaced — was
+/// this does not compile, because the alternative (the one this replaced) was
 /// a build that quietly accepted the call and did nothing with it.
-#[cfg(feature = "quickjs")]
+///
+/// Each application gets its own file so one cannot read another's settings
+/// (§17.3). A plugin host builds a policy per plugin instead; this is the
+/// single-application path.
 pub fn set_storage_path(path: std::path::PathBuf) {
-    quickjs::host::set_storage_path(path);
+    crate::policy::update_default(|policy| policy.with_storage_path(path));
 }
 
 /// Relaxes the sandbox for a development session.
-#[cfg(feature = "quickjs")]
 pub fn set_development_mode(enabled: bool) {
-    quickjs::sandbox::set_development_mode(enabled);
+    active::set_development_mode(enabled);
 }

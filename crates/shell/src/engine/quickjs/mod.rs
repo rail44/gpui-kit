@@ -22,7 +22,7 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, anyhow};
-use gpui::{App, AppContext as _, ClickEvent, Entity, Global, Subscription, WeakEntity, Window};
+use gpui::{App, AppContext as _, ClickEvent, Entity, Global, WeakEntity, Window};
 use rquickjs::{
     Array, Context as JsContext, Ctx, Error as JsError, Exception, FromJs, Function, Object,
     Persistent, Result as JsResult, Value,
@@ -268,42 +268,6 @@ mod component_callback_value_tests {
     use super::*;
     use gpui::{Empty, TestAppContext, VisualTestContext};
     use std::ops::Deref;
-
-    #[test]
-    fn returning_to_the_installed_app_effect_cancels_a_pending_replacement() {
-        let key = "menu".to_owned();
-        let mut pending = HashMap::new();
-        let mut installed = HashMap::from([(
-            key.clone(),
-            InstalledAppEffect {
-                revision: "a".into(),
-                cleanup: None,
-            },
-        )]);
-
-        assert!(queue_component_app_effect(
-            &mut pending,
-            &installed,
-            &key,
-            "b"
-        ));
-        assert_eq!(pending.get(&key).map(String::as_str), Some("b"));
-        assert!(!queue_component_app_effect(
-            &mut pending,
-            &installed,
-            &key,
-            "a"
-        ));
-        assert!(!pending.contains_key(&key));
-
-        installed.get_mut(&key).unwrap().revision = "b".into();
-        assert!(queue_component_app_effect(
-            &mut pending,
-            &installed,
-            &key,
-            "a"
-        ));
-    }
 
     fn callback(
         runtime: &Rc<ShellRuntime>,
@@ -1074,6 +1038,8 @@ mod overlay;
 pub(crate) mod sandbox;
 mod scheduler;
 
+pub(crate) use sandbox::set_development_mode;
+
 pub(crate) fn cancel_policy_tasks(policy: &Rc<Policy>) {
     scheduler::cancel_policy(policy);
 }
@@ -1099,8 +1065,6 @@ pub(super) struct InputCallbackOwner {
 mod standard;
 mod template;
 mod theme_api;
-#[cfg(feature = "wasm-guest")]
-mod wasm_guest;
 mod window_api;
 
 /// The names each built-in module exports.
@@ -1325,44 +1289,7 @@ fn random_component_state_proof() -> String {
     proof
 }
 
-type AppEffectInstall =
-    Box<dyn FnOnce(&mut App) -> crate::component_registry::ComponentAppEffectCleanup>;
-
-struct InstalledAppEffect {
-    revision: String,
-    cleanup: Option<crate::component_registry::ComponentAppEffectCleanup>,
-}
-
-struct ComponentAppEffectGeneration {
-    application: Rc<ApplicationGeneration>,
-    /// The root view the effects were installed for. Retiring a generation
-    /// runs its cleanups through this view, so a reload does not have to wait
-    /// for the window to close before native state is restored.
-    view: WeakEntity<ScriptView>,
-    pending: HashMap<String, String>,
-    installed: HashMap<String, InstalledAppEffect>,
-    _release: Subscription,
-}
-
-fn queue_component_app_effect(
-    pending: &mut HashMap<String, String>,
-    installed: &HashMap<String, InstalledAppEffect>,
-    key: &str,
-    revision: &str,
-) -> bool {
-    if pending.get(key).is_some_and(|value| value == revision) {
-        return false;
-    }
-    if installed
-        .get(key)
-        .is_some_and(|effect| effect.revision == revision)
-    {
-        pending.remove(key);
-        return false;
-    }
-    pending.insert(key.to_owned(), revision.to_owned());
-    true
-}
+use super::component_host::{self, AppEffectInstall};
 
 pub struct ShellRuntime {
     /// Declared first because fields drop in declaration order and every
@@ -1374,7 +1301,7 @@ pub struct ShellRuntime {
     interactive_inline_layout: Cell<bool>,
     component_states: RefCell<crate::component_registry::RetainedStateStore>,
     pending_component_state_releases: RefCell<Vec<Rc<ApplicationGeneration>>>,
-    component_app_effects: RefCell<HashMap<usize, ComponentAppEffectGeneration>>,
+    component_app_effects: component_host::AppEffects,
     warned_deprecated_exports: RefCell<HashSet<&'static str>>,
     arena: RefCell<SpecArena>,
     /// Templates the script has defined, indexed by the id its closure keeps.
@@ -1759,14 +1686,13 @@ impl ShellRuntime {
         kind: &'static str,
         body: impl FnOnce(&T) -> R,
     ) -> anyhow::Result<R> {
-        self.flush_component_state_releases();
-        let result = self
-            .component_states
-            .try_borrow()
-            .map_err(|_| anyhow!("retained component state is already mutably borrowed"))?
-            .with(handle, kind, body);
-        self.flush_component_state_releases();
-        result
+        component_host::with_state(
+            &self.component_states,
+            &self.pending_component_state_releases,
+            handle,
+            kind,
+            body,
+        )
     }
 
     pub(crate) fn update_component_state<T: std::any::Any, R>(
@@ -1785,14 +1711,15 @@ impl ShellRuntime {
             "retained component state cannot be updated during render or layout"
         );
         let (_scope, _) = scope::enter_runtime(self, window, cx, ScopePhase::Event, None);
-        self.flush_component_state_releases();
-        let result = self
-            .component_states
-            .try_borrow_mut()
-            .map_err(|_| anyhow!("retained component state is already borrowed"))?
-            .with_mut(handle, kind, |state| body(state, window, cx));
-        self.flush_component_state_releases();
-        result
+        component_host::update_state(
+            &self.component_states,
+            &self.pending_component_state_releases,
+            handle,
+            kind,
+            window,
+            cx,
+            body,
+        )
     }
 
     fn release_component_states(&self, application: &Rc<ApplicationGeneration>) {
@@ -1813,167 +1740,36 @@ impl ShellRuntime {
         cx: &mut App,
         install: AppEffectInstall,
     ) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            application.is_active(),
-            "component app effect belongs to a retired application"
-        );
-        let view = view
-            .upgrade()
-            .ok_or_else(|| anyhow!("component app effects require a live root view"))?;
-        let application_key = Rc::as_ptr(&application) as usize;
-
-        let mut generations = self.component_app_effects.borrow_mut();
-        if let std::collections::hash_map::Entry::Vacant(slot) = generations.entry(application_key)
-        {
-            let runtime = Rc::downgrade(self);
-            let release = cx.observe_release(&view, move |_, cx| {
-                if let Some(runtime) = runtime.upgrade() {
-                    runtime.cleanup_component_app_effects(application_key, cx);
-                }
-            });
-            slot.insert(ComponentAppEffectGeneration {
-                application: application.clone(),
-                view: view.downgrade(),
-                pending: HashMap::new(),
-                installed: HashMap::new(),
-                _release: release,
-            });
-        }
-        let generation = generations
-            .get_mut(&application_key)
-            .expect("inserted above");
-        if !queue_component_app_effect(
-            &mut generation.pending,
-            &generation.installed,
-            &key,
-            &revision,
-        ) {
-            return Ok(());
-        }
-        drop(generations);
-
-        let runtime = Rc::downgrade(self);
-        window.defer(cx, move |_, cx| {
-            let Some(runtime) = runtime.upgrade() else {
-                return;
-            };
-            runtime.apply_component_app_effect(application_key, key, revision, install, cx);
-        });
-        Ok(())
+        component_host::schedule_app_effect(
+            self,
+            application,
+            view,
+            key,
+            revision,
+            window,
+            cx,
+            install,
+        )
     }
 
-    fn apply_component_app_effect(
-        &self,
-        application_key: usize,
-        key: String,
-        revision: String,
-        install: AppEffectInstall,
-        cx: &mut App,
-    ) {
-        let old_cleanup = {
-            let mut generations = self.component_app_effects.borrow_mut();
-            let Some(generation) = generations.get_mut(&application_key) else {
-                return;
-            };
-            if !generation.application.is_active()
-                || generation.pending.get(&key) != Some(&revision)
-            {
-                return;
-            }
-            generation.pending.remove(&key);
-            generation
-                .installed
-                .remove(&key)
-                .and_then(|mut effect| effect.cleanup.take())
-        };
-        if let Some(cleanup) = old_cleanup {
-            cleanup(cx);
-        }
-        let cleanup = install(cx);
-        if let Some(generation) = self
-            .component_app_effects
-            .borrow_mut()
-            .get_mut(&application_key)
-        {
-            generation.installed.insert(
-                key,
-                InstalledAppEffect {
-                    revision,
-                    cleanup: Some(cleanup),
-                },
-            );
-        } else {
-            cleanup(cx);
-        }
+    /// Where the application effects of registered components are kept.
+    pub(crate) fn component_app_effects(&self) -> &component_host::AppEffects {
+        &self.component_app_effects
     }
 
-    /// Runs the cleanups an application generation installed, at the moment
-    /// that generation retires.
-    ///
-    /// Without this, a reload would leave the previous generation's native
-    /// state — menus, globals, window chrome — installed until the root view
-    /// was released, and the replacing generation could not reach it: keys are
-    /// scoped per generation, so the new install adds to the old rather than
-    /// replacing it. The release subscription remains the backstop for paths
-    /// that have no `App` to run cleanups against.
     fn retire_component_app_effects(
         &self,
         application: &Rc<ApplicationGeneration>,
         cx: &mut impl gpui::AppContext,
     ) {
-        let application_key = Rc::as_ptr(application) as usize;
-        let Some(generation) = self
-            .component_app_effects
-            .borrow_mut()
-            .remove(&application_key)
-        else {
-            return;
-        };
-        let Some(view) = generation.view.upgrade() else {
-            // The view is already gone, so the release subscription has run.
-            return;
-        };
-        let mut generation = generation;
-        view.update(cx, |_, cx| {
-            for (_, mut effect) in generation.installed.drain() {
-                if let Some(cleanup) = effect.cleanup.take() {
-                    cleanup(cx);
-                }
-            }
-        });
-    }
-
-    fn cleanup_component_app_effects(&self, application_key: usize, cx: &mut App) {
-        let Some(mut generation) = self
-            .component_app_effects
-            .borrow_mut()
-            .remove(&application_key)
-        else {
-            return;
-        };
-        for (_, mut effect) in generation.installed.drain() {
-            if let Some(cleanup) = effect.cleanup.take() {
-                cleanup(cx);
-            }
-        }
+        component_host::retire_app_effects(&self.component_app_effects, application, cx);
     }
 
     fn flush_component_state_releases(&self) {
-        loop {
-            let pending = std::mem::take(&mut *self.pending_component_state_releases.borrow_mut());
-            if pending.is_empty() {
-                return;
-            }
-            let Ok(mut states) = self.component_states.try_borrow_mut() else {
-                self.pending_component_state_releases
-                    .borrow_mut()
-                    .extend(pending);
-                return;
-            };
-            for application in pending {
-                states.release_application(&application);
-            }
-        }
+        component_host::flush_state_releases(
+            &self.component_states,
+            &self.pending_component_state_releases,
+        );
     }
 
     #[cfg(test)]
@@ -2115,8 +1911,6 @@ impl ShellRuntime {
         release.retire(cx);
         cancel_application_tasks(application);
         self.retire_templates(application);
-        #[cfg(feature = "wasm-guest")]
-        wasm_guest::release(application);
     }
 
     /// The `Drop`-path counterpart of [`Self::release_application_generation`].
@@ -2134,8 +1928,6 @@ impl ShellRuntime {
         release.retire_without_context();
         cancel_application_tasks(application);
         self.retire_templates(application);
-        #[cfg(feature = "wasm-guest")]
-        wasm_guest::release(application);
     }
 
     fn rollback_retained_since(
@@ -2226,18 +2018,6 @@ impl ShellRuntime {
         );
 
         let entry = root.join(entry);
-        // A `.wasm` entry is a WebAssembly guest view; what the module loader
-        // evaluates is the generated view class that hosts it.
-        #[cfg(feature = "wasm-guest")]
-        let source = if entry
-            .extension()
-            .is_some_and(|extension| extension == "wasm")
-        {
-            wasm_guest::load_module(&entry, &application)?
-        } else {
-            read_module_source(&entry)?
-        };
-        #[cfg(not(feature = "wasm-guest"))]
         let source = read_module_source(&entry)?;
 
         // The entry carries the generation too: it is a cached module like any
@@ -7944,8 +7724,6 @@ impl ShellRuntime {
             host_modules::install(ctx)?;
             theme_api::install(ctx, &module)?;
             entity_api::install(ctx, &module, runtime.clone())?;
-            #[cfg(feature = "wasm-guest")]
-            wasm_guest::install(ctx, runtime.clone())?;
             dock_api::install(ctx, &module, runtime.clone())?;
             scheduler::install(ctx, &module)?;
             // Standard Runtime constructors and prototypes must exist before

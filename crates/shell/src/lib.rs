@@ -14,6 +14,17 @@
 //! reflection table, including in release builds. This crate therefore enables
 //! `gpui-base/inspector`, which Cargo unifies across the embedding application's
 //! dependency graph.
+//!
+//! `wasm-engine`, in place of the default `quickjs`, runs applications that
+//! are WebAssembly modules (`gpui-shell-wasm-guest` builds them) and links no
+//! JavaScript engine. Everything above the engine seam is shared, so a build
+//! with it carries script-only surface (typings, template caches, a few
+//! component hooks) that nothing calls; those are left in rather than gated
+//! one by one.
+
+// Script-only surface above the seam is unused under the WebAssembly engine;
+// see the feature note above.
+#![cfg_attr(feature = "wasm-engine", allow(dead_code))]
 
 // # The surface a host may rely on
 //
@@ -84,6 +95,7 @@ pub mod host;
 pub mod host_modules;
 pub(crate) mod materialize;
 pub mod metrics;
+pub(crate) mod net;
 pub(crate) mod path;
 pub mod plugin;
 pub mod policy;
@@ -97,7 +109,9 @@ pub mod snapshot;
 pub(crate) mod spec;
 pub(crate) mod storage;
 pub(crate) mod style;
-#[cfg(test)]
+// The runtime's own suite drives script applications, so it runs with the
+// script engine; the WebAssembly engine's tests live beside it.
+#[cfg(all(test, feature = "quickjs"))]
 mod tests;
 pub(crate) mod theme_tokens;
 mod typings;
@@ -109,7 +123,7 @@ pub use anyhow;
 pub use assets::AppAssets;
 pub use capability::{Capabilities, ExecuteGrant, HttpRequestGrant};
 pub use component::ComponentArgs;
-#[cfg(test)]
+#[cfg(all(test, feature = "quickjs"))]
 pub(crate) use component_registry::ComponentState;
 pub use component_registry::{
     ArgumentDescriptor, ArgumentSchema, COMPONENT_REGISTRY_API_VERSION, ComponentArgument,

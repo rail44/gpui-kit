@@ -33,10 +33,7 @@
 //! become awaitable is still open, and is the only synchronous write left.
 
 use crate::engine::quickjs::js_error;
-use std::{
-    path::{Path, PathBuf},
-    rc::Rc,
-};
+use std::{path::Path, rc::Rc};
 
 use gpui::{App, ClipboardItem};
 use rquickjs::{
@@ -65,15 +62,6 @@ use super::{
 /// answer.
 pub fn capabilities() -> Capabilities {
     scope::policy().capabilities().clone()
-}
-
-/// Points the default policy's store at its backing file.
-///
-/// Each application gets its own file so one cannot read another's settings
-/// (§17.3). A plugin host builds a policy per plugin instead; this is the
-/// single-application path.
-pub fn set_storage_path(path: PathBuf) {
-    crate::policy::update_default(|policy| policy.with_storage_path(path));
 }
 
 /// The context argument is the engine's; the sub-objects are built from the
@@ -1078,9 +1066,9 @@ fn write_to_clipboard(ctx: Ctx<'_>, text: String) -> JsResult<()> {
 
 /// Read and write are separate grants, so the denial names the half that was
 /// missing. Wording follows [`CapabilityError`].
-pub(super) const CLIPBOARD_READ_DENIED: &str =
+const CLIPBOARD_READ_DENIED: &str =
     "reading the clipboard is not granted; declare capabilities.clipboard.read in the manifest";
-pub(super) const CLIPBOARD_WRITE_DENIED: &str =
+const CLIPBOARD_WRITE_DENIED: &str =
     "writing the clipboard is not granted; declare capabilities.clipboard.write in the manifest";
 
 /// Runs `body` against GPUI's `App`.
@@ -1191,9 +1179,12 @@ impl<'js> FromJs<'js> for Printable {
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use std::path::PathBuf;
+
     use rquickjs::{Context as JsContext, Runtime as JsRuntime};
 
     use super::*;
+    use crate::engine::set_storage_path;
 
     /// A directory of our own under the system temporary directory. `tempfile`
     /// is not a dependency of this crate and one test module is not a reason to

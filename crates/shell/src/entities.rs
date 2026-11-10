@@ -226,7 +226,7 @@ impl EntityRelease {
         for (view, runtime) in &self.views {
             if let Some(runtime) = runtime.upgrade() {
                 runtime.retire_view_callbacks(view.entity_id());
-                crate::engine::quickjs::cancel_view_tasks(&runtime, view.entity_id());
+                crate::engine::cancel_view_tasks(&runtime, view.entity_id());
             }
         }
     }

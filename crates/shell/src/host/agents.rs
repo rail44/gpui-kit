@@ -10,7 +10,7 @@
 use std::path::{Path, PathBuf};
 
 use super::HostBrand;
-use crate::engine::quickjs::exports;
+use crate::engine::exports;
 
 /// The file written into an application directory. `AGENTS.md` is the name
 /// coding agents look for without being told.
@@ -123,6 +123,7 @@ mod tests {
         HostBrand::new("gpui-shell", "1.2.3")
     }
 
+    #[cfg(feature = "quickjs")] // loads a script application
     #[test]
     fn the_instructions_name_this_host_and_its_modules() {
         let text = render(brand(), &crate::FrozenComponentRegistry::default());

@@ -295,7 +295,7 @@ impl Drop for ScriptView {
                 // Child-owned retained records are removed by EntityStore in
                 // the same operation that removes the child handle. Reaching
                 // back into that RefCell here would re-enter its mutable borrow.
-                crate::engine::quickjs::cancel_view_tasks(&self.runtime, entity_id);
+                crate::engine::cancel_view_tasks(&self.runtime, entity_id);
             }
         }
     }

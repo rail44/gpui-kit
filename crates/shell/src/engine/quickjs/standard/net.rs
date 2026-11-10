@@ -12,10 +12,8 @@ use rquickjs::{
     module::{Declarations, Exports, ModuleDef},
 };
 
-use super::{
-    super::{host, scheduler},
-    connect as network_connect,
-};
+use super::super::{host, scheduler};
+use crate::net::connect as network_connect;
 
 const IO_LIMIT: usize = 1024 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(30);

@@ -113,7 +113,7 @@ where
         })?
 }
 
-pub(super) fn connect_tcp(
+pub(crate) fn connect_tcp(
     host: &str,
     port: u16,
     timeout: Duration,
@@ -158,7 +158,7 @@ where
     ))
 }
 
-pub(super) fn remaining_io_timeout(deadline: Instant, operation: &str) -> Result<Duration, String> {
+pub(crate) fn remaining_io_timeout(deadline: Instant, operation: &str) -> Result<Duration, String> {
     remaining(deadline, operation)
 }
 

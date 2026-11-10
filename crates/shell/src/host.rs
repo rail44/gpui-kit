@@ -1149,10 +1149,9 @@ fn install_palette(cx: &mut App) {
     }
 }
 
-/// Reads and validates inert application metadata before any entry code runs.
 /// The application root for `check`: the directory holding `main.js`, or one
-/// holding a manifest, whose `entry` the load reads instead (it may name
-/// another script or, with `wasm-guest`, a WebAssembly guest).
+/// holding a manifest, whose `entry` the load reads instead (another script,
+/// or under the `wasm-engine` build a WebAssembly guest).
 fn manifest_or_entry_root(directory: &Path) -> anyhow::Result<PathBuf> {
     match crate::resolve_app_root(directory, ENTRY) {
         Ok(root) => Ok(root),
@@ -1163,6 +1162,7 @@ fn manifest_or_entry_root(directory: &Path) -> anyhow::Result<PathBuf> {
     }
 }
 
+/// Reads and validates inert application metadata before any entry code runs.
 fn read_local_manifest(root: &Path) -> Result<Option<crate::plugin::PluginManifest>, String> {
     let path = root.join(crate::plugin::MANIFEST_FILE);
     if !path.exists() {

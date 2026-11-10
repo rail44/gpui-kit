@@ -28,9 +28,16 @@ gpui-fast = [
     "gpui-webview?/gpui-fast",
 ]
 default = ["quickjs", "components", "webview"]
-# Spike: WebAssembly guest views hosted by the QuickJS runtime
-# (`engine/quickjs/wasm_guest.rs`).
-wasm-guest = ["quickjs", "components", "dep:wasmtime", "dep:gpui-shell-wasm-abi", "dep:postcard"]
+# The WebAssembly engine: applications are wasm guests and no JavaScript
+# engine is linked (`engine/wasm`). Exclusive with `quickjs`.
+wasm-engine = [
+    "components",
+    "dep:wasmtime",
+    "dep:gpui-shell-wasm-abi",
+    "dep:postcard",
+    "dep:reqwest",
+    "dep:tungstenite",
+]
 # The `gpui-component` catalog (`gpui_shell::components`), which scripts import
 # as `"gpui-component"`. Without it the runtime binds `gpui-base` only and does
 # not depend on the styled component library at all.
@@ -41,8 +48,8 @@ components = ["dep:gpui-component"]
 # runtime; on Linux a page needs an X11 or XWayland window.
 webview = ["components", "gpui-fast", "dep:gpui-webview", "dep:wry"]
 # The scripting engine. See `src/engine/mod.rs` for the surface an engine has
-# to provide; QuickJS is the only implementation today, and the feature exists
-# so a second one can be added without the seam having to be invented first.
+# to provide; `wasm-engine` is the other implementation, and the two are
+# exclusive.
 quickjs = [
     "dep:rquickjs",
     "dep:rquickjs-jit",

@@ -1356,7 +1356,7 @@ impl Plugin {
             self.runtime
                 .release_application_generation_without_context(&application);
         }
-        crate::engine::quickjs::cancel_policy_tasks(&self.policy);
+        crate::engine::cancel_policy_tasks(&self.policy);
     }
 }
 
@@ -1421,7 +1421,7 @@ fn load_view_with_policy(
     };
 
     if loaded.is_err() {
-        crate::engine::quickjs::cancel_policy_tasks(&policy);
+        crate::engine::cancel_policy_tasks(&policy);
     }
     loaded
 }
@@ -1932,6 +1932,7 @@ mod tests {
         assert!(Rc::ptr_eq(&replacement, &installed));
     }
 
+    #[cfg(feature = "quickjs")] // loads a script application
     #[gpui::test]
     fn runtime_load_builds_the_window_root_without_plugin_manager_ceremony(
         cx: &mut TestAppContext,
@@ -2009,6 +2010,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "quickjs")] // loads a script application
     #[gpui::test]
     fn runtime_check_returns_the_rendered_description(cx: &mut TestAppContext) {
         cx.update(crate::init);
@@ -2040,6 +2042,7 @@ mod tests {
         assert_eq!(metrics.materializations(), 1);
     }
 
+    #[cfg(feature = "quickjs")] // loads a script application
     #[gpui::test]
     fn runtime_check_materializes_text_views_without_drawing(cx: &mut TestAppContext) {
         cx.update(crate::init);
@@ -2070,6 +2073,7 @@ mod tests {
         assert!(description.contains("<p>HTML</p>"));
     }
 
+    #[cfg(feature = "quickjs")] // loads a script application
     #[gpui::test]
     fn runtime_load_uses_the_manifest_entry_without_plugin_manager_ceremony(
         cx: &mut TestAppContext,
@@ -2151,7 +2155,7 @@ mod tests {
         let runtime = cx
             .update(ShellRuntime::new)
             .expect("default application runtime");
-        let tasks_before = crate::engine::quickjs::task_count();
+        let tasks_before = crate::engine::task_count();
         let window = cx.add_window(|_, _| gpui::Empty);
         let mut context = VisualTestContext::from_window(*window.deref(), cx);
         let root = context.update(|window, cx| runtime.load(application.path(), window, cx));
@@ -2167,12 +2171,13 @@ mod tests {
             );
         });
         assert_eq!(
-            crate::engine::quickjs::task_count(),
+            crate::engine::task_count(),
             tasks_before,
             "tasks started before initialization failed must be cancelled"
         );
     }
 
+    #[cfg(feature = "quickjs")] // loads a script application
     #[gpui::test]
     fn async_init_runs_under_the_plugin_policy_and_notifies_its_view(cx: &mut TestAppContext) {
         let plugins = TempTree::new("async-init");
@@ -2262,6 +2267,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "quickjs")] // loads a script application
     #[gpui::test]
     fn unloading_a_plugin_releases_its_entities_and_subscriptions(cx: &mut TestAppContext) {
         let plugins = TempTree::new("unload-entities");
@@ -2311,6 +2317,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "quickjs")] // loads a script application
     #[gpui::test]
     fn dropping_plugin_manager_shuts_down_loaded_plugins(cx: &mut TestAppContext) {
         let plugins = TempTree::new("drop-manager");
@@ -2340,7 +2347,7 @@ mod tests {
         cx.update(crate::init);
         let runtime = ShellRuntime::new_isolated().expect("runtime");
         cx.update(|cx| runtime.set_global(cx));
-        let tasks_before = crate::engine::quickjs::task_count();
+        let tasks_before = crate::engine::task_count();
         let window = cx.add_window(|_, _| Empty);
         let mut context = VisualTestContext::from_window(*window.deref(), cx);
         let mut manager = PluginManager::new(vec![plugins.path().to_path_buf()])
@@ -2358,7 +2365,7 @@ mod tests {
             .view()
             .clone();
         assert_eq!(runtime.entities().len(), 1);
-        assert_eq!(crate::engine::quickjs::task_count(), tasks_before + 1);
+        assert_eq!(crate::engine::task_count(), tasks_before + 1);
 
         drop(manager);
 
@@ -2367,7 +2374,7 @@ mod tests {
             "dropping the manager must release application-owned entities even while GPUI retains the view"
         );
         assert_eq!(
-            crate::engine::quickjs::task_count(),
+            crate::engine::task_count(),
             tasks_before,
             "dropping the manager must cancel application-owned tasks"
         );

@@ -11,25 +11,20 @@
 
 use rquickjs::{Ctx, Result, loader::BuiltinResolver, loader::ModuleLoader};
 
-mod connect;
 mod console;
 mod encoding;
-pub(in crate::engine::quickjs) mod fetch;
+mod fetch;
 mod fs;
 mod net;
 mod os;
 mod process;
-pub(in crate::engine::quickjs) mod websocket;
+mod websocket;
 
 #[cfg(test)]
 pub(super) fn direct_test_http_client()
 -> std::result::Result<reqwest::blocking::Client, reqwest::Error> {
-    fetch::direct_test_client()
+    crate::net::http::direct_test_client()
 }
-
-/// What `fetch` and the WebSocket handshake send when the script names no
-/// `User-Agent`. Some APIs — GitHub's among them — refuse a request without one.
-const USER_AGENT: &str = concat!("gpui-shell/", env!("CARGO_PKG_VERSION"));
 
 pub(super) const NAMES: &[&str] = &[
     "buffer",

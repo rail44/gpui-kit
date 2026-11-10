@@ -770,10 +770,10 @@ impl ShellRoot {
 impl Drop for ShellRoot {
     fn drop(&mut self) {
         if let Some(application) = self.application_generation.take() {
-            crate::engine::quickjs::cancel_application_tasks(&application);
+            crate::engine::cancel_application_tasks(&application);
         }
         if let Some(policy) = self.application_policy.take() {
-            crate::engine::quickjs::cancel_policy_tasks(&policy);
+            crate::engine::cancel_policy_tasks(&policy);
         }
     }
 }

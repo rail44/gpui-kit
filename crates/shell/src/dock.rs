@@ -1068,7 +1068,8 @@ pub fn dock_data(dock: &DockContext) -> Value {
     })
 }
 
-#[cfg(test)]
+// Their panels are script views, so they run with the script engine.
+#[cfg(all(test, feature = "quickjs"))]
 mod tests {
     use std::{cell::RefCell, ops::Deref as _};
 

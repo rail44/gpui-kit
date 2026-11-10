@@ -327,6 +327,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "quickjs")] // loads a script application
     #[test]
     fn adapter_runtime_owns_the_registered_component_catalog() {
         let runtime = super::new_isolated_runtime().unwrap();
@@ -497,6 +498,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "quickjs")] // loads a script application
     #[test]
     fn runtime_typings_include_leaf_exports_and_methods() {
         let mut registry = ComponentRegistry::new(

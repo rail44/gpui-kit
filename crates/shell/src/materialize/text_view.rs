@@ -357,5 +357,6 @@ fn animation_frames(
     Ok(decoded)
 }
 
-#[cfg(test)]
+// Mounted through a script view, so they run with the script engine.
+#[cfg(all(test, feature = "quickjs"))]
 mod tests;

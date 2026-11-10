@@ -3362,12 +3362,12 @@ export default class Parent extends View {
         };
     let retained_before = runtime.entities().len();
     let aliases_before = runtime.nested_view_alias_count();
-    let tasks_before = crate::engine::quickjs::task_count();
+    let tasks_before = crate::engine::task_count();
     let fail = change(&mut context, &parent, "fail-update");
     context.update(|window, cx| runtime.dispatch_change(fail, true, window, cx));
     assert_eq!(runtime.entities().len(), retained_before);
     assert_eq!(runtime.nested_view_alias_count(), aliases_before);
-    assert_eq!(crate::engine::quickjs::task_count(), tasks_before);
+    assert_eq!(crate::engine::task_count(), tasks_before);
 
     // Force a fresh child build through its pre-update callback. If `update`
     // touched the live object this would expose "half committed" here.
@@ -3531,7 +3531,7 @@ export default class Parent extends View {
   }
 }
 "#;
-    let baseline_tasks = crate::engine::quickjs::task_count();
+    let baseline_tasks = crate::engine::task_count();
     let view_type = runtime
         .load_source("nested-public-release-cleanup.js", source)
         .expect("load");
@@ -3563,7 +3563,7 @@ export default class Parent extends View {
     });
     assert_eq!(runtime.entities().len(), 4);
     assert_eq!(runtime.nested_view_alias_count(), 2);
-    assert_eq!(crate::engine::quickjs::task_count(), baseline_tasks + 2);
+    assert_eq!(crate::engine::task_count(), baseline_tasks + 2);
     assert_eq!(runtime.live_callbacks(), 3);
 
     let release = context.update(|_, cx| {
@@ -3588,7 +3588,7 @@ export default class Parent extends View {
 
     assert!(runtime.entities().is_empty());
     assert_eq!(runtime.nested_view_alias_count(), 0);
-    assert_eq!(crate::engine::quickjs::task_count(), baseline_tasks);
+    assert_eq!(crate::engine::task_count(), baseline_tasks);
     assert_eq!(
         runtime.live_callbacks(),
         1,
@@ -3782,7 +3782,7 @@ export default class Parent extends View {
   render(cx) { return "parent"; }
 }
 "#;
-    let tasks = crate::engine::quickjs::task_count();
+    let tasks = crate::engine::task_count();
     let view_type = runtime
         .load_source("nested-public-constructor-failure.js", source)
         .expect("load");
@@ -3797,7 +3797,7 @@ export default class Parent extends View {
     );
     assert!(runtime.entities().is_empty());
     assert_eq!(runtime.nested_view_alias_count(), 0);
-    assert_eq!(crate::engine::quickjs::task_count(), tasks);
+    assert_eq!(crate::engine::task_count(), tasks);
 }
 
 #[gpui::test]
@@ -6272,7 +6272,7 @@ fn reload_replaces_old_tasks_and_rolls_back_failed_new_tasks(cx: &mut TestAppCon
 
     let window = cx.add_window(|_, _| Empty);
     let mut context = VisualTestContext::from_window(*window.deref(), cx);
-    let baseline = crate::engine::quickjs::task_count();
+    let baseline = crate::engine::task_count();
     let view = context.update(|window, cx| {
         let policy = Rc::new(Policy::default());
         let (_scope, _) = crate::scope::enter_with_runtime(
@@ -6288,7 +6288,7 @@ fn reload_replaces_old_tasks_and_rolls_back_failed_new_tasks(cx: &mut TestAppCon
             .instantiate_view_with_policy(&view_type, policy, window, cx)
             .expect("instantiate")
     });
-    assert_eq!(crate::engine::quickjs::task_count(), baseline + 1);
+    assert_eq!(crate::engine::task_count(), baseline + 1);
 
     std::fs::write(directory.join("main.js"), source("second")).expect("replacement source");
     context
@@ -6297,7 +6297,7 @@ fn reload_replaces_old_tasks_and_rolls_back_failed_new_tasks(cx: &mut TestAppCon
         })
         .expect("successful reload");
     assert_eq!(
-        crate::engine::quickjs::task_count(),
+        crate::engine::task_count(),
         baseline + 1,
         "the old instance's timer must be retired when the new one commits"
     );
@@ -6315,7 +6315,7 @@ fn reload_replaces_old_tasks_and_rolls_back_failed_new_tasks(cx: &mut TestAppCon
         })
         .expect_err("the replacement must fail");
     assert_eq!(
-        crate::engine::quickjs::task_count(),
+        crate::engine::task_count(),
         baseline + 1,
         "work created by a failed reload must be rolled back"
     );
@@ -6335,7 +6335,7 @@ fn reload_replaces_old_tasks_and_rolls_back_failed_new_tasks(cx: &mut TestAppCon
         })
         .expect_err("initialization failure must roll back the candidate generation");
     assert_eq!(
-        crate::engine::quickjs::task_count(),
+        crate::engine::task_count(),
         baseline + 1,
         "work created by a candidate init must be rolled back without touching the live app"
     );
@@ -6622,7 +6622,7 @@ export default class Panel extends View {
     )
     .expect("main.js");
 
-    let before = crate::engine::quickjs::task_count();
+    let before = crate::engine::task_count();
     let window = cx.add_window(|_, _| Empty);
     let mut context = VisualTestContext::from_window(*window.deref(), cx);
     context.update(|window, cx| {
@@ -6642,7 +6642,7 @@ export default class Panel extends View {
     });
 
     assert_eq!(
-        crate::engine::quickjs::task_count(),
+        crate::engine::task_count(),
         before + 1,
         "work started from init must reach the scheduler"
     );
