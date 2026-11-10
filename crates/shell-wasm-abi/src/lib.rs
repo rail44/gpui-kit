@@ -25,7 +25,8 @@ pub mod export {
     /// `fn()`: constructs the view. Runs where gpui-shell runs a script view's
     /// `init`, so retained state may be created here.
     pub const INIT: &str = "gpui_shell_init";
-    /// `fn() -> u64`: describes one render; returns a packed buffer holding a
+    /// `fn(part: u32) -> u64`: describes one render of the view (part 0) or
+    /// of one of its parts; returns a packed buffer holding a
     /// postcard-encoded [`super::Description`]. (Handler payloads stay JSON:
     /// they are small, and a click's shape is the host's to choose.)
     pub const RENDER: &str = "gpui_shell_render";
@@ -113,6 +114,14 @@ pub mod import {
     /// `fn(text_ptr: u32, text_len: u32)`: replaces the clipboard's text,
     /// under the `clipboard.write` grant.
     pub const CLIPBOARD_WRITE: &str = "clipboard_write";
+    /// `fn(part: u32)`: opens a part as a dialog over the window, from a
+    /// handler (as a script's `window.open_dialog`).
+    pub const OPEN_DIALOG: &str = "open_dialog";
+    /// `fn()`: closes the topmost dialog.
+    pub const CLOSE_DIALOG: &str = "close_dialog";
+    /// `fn(toast_ptr: u32, toast_len: u32)`: shows a toast described as JSON
+    /// `{"title", "description", "level"}`.
+    pub const PUSH_TOAST: &str = "push_toast";
 }
 
 /// What a lookup import returns for "no value", distinct from any packed
@@ -171,6 +180,9 @@ pub enum Component {
     Checkbox(String),
     /// A retained input, by the handle `input_new` returned.
     Input(u32),
+    /// A part of the guest drawn in place by a view of its own (a script's
+    /// child view), by the part number the guest registered.
+    Nested(u32),
     /// A component the host's catalog registered (`gpui-component`'s
     /// `Button`, `Tag`, `Progress`, ...), by its constructor's export name.
     Registered {

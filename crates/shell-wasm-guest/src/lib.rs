@@ -35,8 +35,8 @@ use serde_json::Value;
 
 pub mod prelude {
     pub use crate::{
-        CArg, ComponentState, Cx, Data, Element, Event, Handler, InputState, View, button,
-        checkbox, component, div, export_view, h_flex, input, text, v_flex,
+        CArg, ComponentState, Cx, Data, Element, Event, Handler, InputState, Part, ToastLevel,
+        View, button, checkbox, component, div, export_view, h_flex, input, nested, text, v_flex,
     };
 }
 
@@ -62,15 +62,23 @@ impl Event {
 
 type Callback<V> = Rc<dyn Fn(&mut V, &Event, &mut Cx<V>)>;
 
-/// The high bit marks a handler registered outside `render` (an input's
+type PartRenderer<V> = Rc<dyn Fn(&mut V, &mut Cx<V>) -> Element>;
+
+/// The high bit marks a handler registered outside a render (an input's
 /// submit handler), which lives as long as the view rather than one render.
 const PERSISTENT: u32 = 1 << 31;
+/// A render handler's id carries the part that rendered it in these bits, so
+/// one part's render never discards another part's handlers.
+const PART_SHIFT: u32 = 24;
+const INDEX_MASK: u32 = (1 << PART_SHIFT) - 1;
 
 /// What a view's `init`, `render` and handlers are handed.
 pub struct Cx<V> {
-    per_render: Vec<Callback<V>>,
+    /// Handlers registered by the latest render of each part (0 is the view).
+    per_render: Vec<Vec<Callback<V>>>,
     persistent: Vec<Callback<V>>,
-    rendering: bool,
+    parts: Vec<PartRenderer<V>>,
+    rendering: Option<u32>,
     notify: bool,
 }
 
@@ -78,34 +86,93 @@ pub struct Cx<V> {
 #[derive(Clone, Copy, Debug)]
 pub struct Handler(u32);
 
+/// A separately rendered piece of the view: shown in a dialog
+/// ([`Cx::open_dialog`]) or nested in the tree ([`nested`]), each with its own
+/// invalidation, as a script's child view or dialog content function is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Part(u32);
+
+/// How urgent a toast is.
+#[derive(Clone, Copy, Debug)]
+pub enum ToastLevel {
+    Info,
+    Success,
+    Warning,
+    Error,
+}
+
 impl<V: 'static> Cx<V> {
     fn new() -> Self {
         Self {
-            per_render: Vec::new(),
+            per_render: vec![Vec::new()],
             persistent: Vec::new(),
-            rendering: false,
+            parts: Vec::new(),
+            rendering: None,
             notify: false,
         }
     }
 
     /// Wraps a handler that gets the view mutably, the way GPUI's
-    /// `cx.listener` does. Inside `render` it lives until the next render;
-    /// elsewhere it lives as long as the view.
+    /// `cx.listener` does. Inside a render it lives until that part renders
+    /// again; elsewhere it lives as long as the view.
     pub fn listener(&mut self, f: impl Fn(&mut V, &Event, &mut Cx<V>) + 'static) -> Handler {
         let f: Callback<V> = Rc::new(f);
-        if self.rendering {
-            self.per_render.push(f);
-            Handler(self.per_render.len() as u32 - 1)
-        } else {
-            self.persistent.push(f);
-            Handler(PERSISTENT | (self.persistent.len() as u32 - 1))
+        match self.rendering {
+            Some(part) => {
+                let handlers = &mut self.per_render[part as usize];
+                handlers.push(f);
+                Handler((part << PART_SHIFT) | (handlers.len() as u32 - 1))
+            }
+            None => {
+                self.persistent.push(f);
+                Handler(PERSISTENT | (self.persistent.len() as u32 - 1))
+            }
         }
     }
 
-    /// Asks the host to render the view again.
+    /// Asks the host to render the view, and every part of it, again.
     pub fn notify(&mut self) {
         self.notify = true;
     }
+
+    /// Registers a part: a render function for a piece shown on its own.
+    pub fn part(&mut self, render: impl Fn(&mut V, &mut Cx<V>) -> Element + 'static) -> Part {
+        self.parts.push(Rc::new(render));
+        self.per_render.push(Vec::new());
+        Part(self.parts.len() as u32)
+    }
+
+    /// Opens `part` as a dialog over the window. From a handler only.
+    pub fn open_dialog(&mut self, part: Part) {
+        unsafe { host::open_dialog(part.0) }
+    }
+
+    /// Closes the topmost dialog.
+    pub fn close_dialog(&mut self) {
+        unsafe { host::close_dialog() }
+    }
+
+    /// Shows a toast, as a script's `window.push_toast`.
+    pub fn push_toast(&mut self, title: &str, description: Option<&str>, level: ToastLevel) {
+        let level = match level {
+            ToastLevel::Info => "info",
+            ToastLevel::Success => "success",
+            ToastLevel::Warning => "warning",
+            ToastLevel::Error => "error",
+        };
+        let toast = serde_json::json!({
+            "title": title,
+            "description": description,
+            "level": level,
+        })
+        .to_string();
+        unsafe { host::push_toast(toast.as_ptr() as u32, toast.len() as u32) }
+    }
+}
+
+/// A part drawn in place, with its own invalidation: a script's child view.
+pub fn nested(part: Part) -> Element {
+    element(Component::Nested(part.0))
 }
 
 /// One element under construction.
@@ -751,6 +818,9 @@ mod host {
         pub fn input_set_value(handle: u32, ptr: u32, len: u32);
         pub fn input_on_submit(handle: u32, callback: u32);
         pub fn log(ptr: u32, len: u32);
+        pub fn open_dialog(part: u32);
+        pub fn close_dialog();
+        pub fn push_toast(toast_ptr: u32, toast_len: u32);
         pub fn http_get(url_ptr: u32, url_len: u32, callback: u32);
         pub fn http_request(request_ptr: u32, request_len: u32, callback: u32);
         pub fn process_run(request_ptr: u32, request_len: u32, callback: u32);
@@ -809,6 +879,15 @@ mod host {
         unimplemented!("gpui-shell host imports exist only in a wasm32 guest")
     }
     pub unsafe fn log(_: u32, _: u32) {}
+    pub unsafe fn open_dialog(_: u32) {
+        unimplemented!("gpui-shell host imports exist only in a wasm32 guest")
+    }
+    pub unsafe fn close_dialog() {
+        unimplemented!("gpui-shell host imports exist only in a wasm32 guest")
+    }
+    pub unsafe fn push_toast(_: u32, _: u32) {
+        unimplemented!("gpui-shell host imports exist only in a wasm32 guest")
+    }
     pub unsafe fn http_get(_: u32, _: u32, _: u32) {
         unimplemented!("gpui-shell host imports exist only in a wasm32 guest")
     }
@@ -901,12 +980,23 @@ impl<V: View> Guest<V> {
         self.view = Some(V::init(&mut self.cx));
     }
 
-    pub fn render(&mut self) -> u64 {
+    /// Renders the view (`part` 0) or one of its parts.
+    pub fn render(&mut self, part: u32) -> u64 {
         let view = self.view.as_mut().expect("render before init");
-        self.cx.per_render.clear();
-        self.cx.rendering = true;
-        let element = view.render(&mut self.cx);
-        self.cx.rendering = false;
+        let renderer = match part {
+            0 => None,
+            part => match self.cx.parts.get(part as usize - 1) {
+                Some(renderer) => Some(renderer.clone()),
+                None => return abi::pack(0, 0),
+            },
+        };
+        self.cx.per_render[part as usize].clear();
+        self.cx.rendering = Some(part);
+        let element = match renderer {
+            None => view.render(&mut self.cx),
+            Some(renderer) => renderer(view, &mut self.cx),
+        };
+        self.cx.rendering = None;
         self.last = postcard::to_allocvec(&element.into_description()).unwrap_or_default();
         abi::pack(self.last.as_ptr() as u32, self.last.len() as u32)
     }
@@ -916,7 +1006,10 @@ impl<V: View> Guest<V> {
         let handler = if callback & PERSISTENT != 0 {
             self.cx.persistent.get((callback & !PERSISTENT) as usize)
         } else {
-            self.cx.per_render.get(callback as usize)
+            self.cx
+                .per_render
+                .get((callback >> PART_SHIFT) as usize)
+                .and_then(|handlers| handlers.get((callback & INDEX_MASK) as usize))
         }
         .cloned();
         let (Some(handler), Some(view)) = (handler, self.view.as_mut()) else {
@@ -951,8 +1044,8 @@ macro_rules! export_view {
         }
 
         #[unsafe(no_mangle)]
-        pub extern "C" fn gpui_shell_render() -> u64 {
-            GUEST.with(|guest| guest.borrow_mut().render())
+        pub extern "C" fn gpui_shell_render(part: u32) -> u64 {
+            GUEST.with(|guest| guest.borrow_mut().render(part))
         }
 
         #[unsafe(no_mangle)]
@@ -1014,7 +1107,7 @@ mod tests {
     fn render_handlers_dispatch_by_number_and_request_a_rerender() {
         let mut guest = Guest::<Counter>::default();
         guest.init();
-        guest.render();
+        guest.render(0);
         let description: Description = postcard::from_bytes(&guest.last).unwrap();
         let root = &description.nodes[description.root as usize];
         assert_eq!(root.ops, [Op::Callback("on_click".into(), 0)]);
@@ -1022,5 +1115,49 @@ mod tests {
         assert_eq!(guest.view.as_ref().unwrap().count, 1);
         // A number this render never handed out is ignored.
         assert_eq!(guest.dispatch(7, b"null".to_vec()), 0);
+    }
+
+    #[test]
+    fn a_part_keeps_its_own_handlers_across_the_views_render() {
+        struct Paged {
+            count: u32,
+            part: Option<Part>,
+        }
+        impl View for Paged {
+            fn init(cx: &mut Cx<Self>) -> Self {
+                let part = cx.part(|this: &mut Paged, cx| {
+                    button("part")
+                        .child(text(this.count.to_string()))
+                        .on_click(cx.listener(|this, _, cx| {
+                            this.count += 10;
+                            cx.notify();
+                        }))
+                });
+                Paged {
+                    count: 0,
+                    part: Some(part),
+                }
+            }
+            fn render(&mut self, _cx: &mut Cx<Self>) -> Element {
+                nested(self.part.unwrap())
+            }
+        }
+
+        let mut guest = Guest::<Paged>::default();
+        guest.init();
+        guest.render(1);
+        let part: Description = postcard::from_bytes(&guest.last).unwrap();
+        let Op::Callback(_, handler) = &part.nodes[part.root as usize].ops[0] else {
+            panic!("the part's button has a handler");
+        };
+        // The view rendering again does not discard the part's handler.
+        guest.render(0);
+        let view: Description = postcard::from_bytes(&guest.last).unwrap();
+        assert_eq!(
+            view.nodes[view.root as usize].component,
+            Component::Nested(1)
+        );
+        assert_eq!(guest.dispatch(*handler, b"null".to_vec()), 1);
+        assert_eq!(guest.view.as_ref().unwrap().count, 10);
     }
 }

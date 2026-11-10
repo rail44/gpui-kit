@@ -43,7 +43,7 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, anyhow};
-use gpui::{App, Entity, WeakEntity, Window};
+use gpui::{App, AppContext as _, Entity, WeakEntity, Window};
 use gpui_shell_wasm_abi::{self as abi, Arg, Description, Op};
 use rquickjs::{Ctx, Function, Persistent, Result as JsResult, Value, function::Func};
 use smallvec::SmallVec;
@@ -131,7 +131,7 @@ fn shim(token: usize) -> String {
         r#"import {{ View }} from "gpui-kit";
 export default class WasmGuestView extends View {{
   init(_props, _cx) {{ this.__guest = __wasm_instantiate({token}); }}
-  render(_cx) {{ return {{ __id: __wasm_render(this.__guest) }}; }}
+  render(_cx) {{ return {{ __id: __wasm_render(this.__guest, 0) }}; }}
 }}
 "#
     )
@@ -148,34 +148,48 @@ pub(super) fn install(ctx: &Ctx<'_>, runtime: Weak<ShellRuntime>) -> JsResult<()
             let runtime = instantiate_runtime
                 .upgrade()
                 .ok_or_else(|| js_error::type_error(&ctx, "the shell runtime is gone"))?;
-            Guest::instantiate(&runtime, token as usize)
-                .map_err(|error| js_error::type_error(&ctx, &format!("{error:#}")))
+            let id = Guest::instantiate(&runtime, token as usize)
+                .map_err(|error| js_error::type_error(&ctx, &format!("{error:#}")))?;
+            // A dialog the guest opened from `init`.
+            if let Some(guest) = guest_by_id(id) {
+                open_pending_dialogs(&ctx, &runtime, &guest)?;
+            }
+            Ok(id)
         }),
+    )?;
+
+    // The view class a part is shown through: what a script's dialog content
+    // function or child view is, rendering the guest's part instead.
+    ctx.eval::<(), _>(
+        "globalThis.__wasm_part_view = (guest, part) => \
+         ({ render(_cx) { return { __id: __wasm_render(guest, part) }; } });",
     )?;
 
     globals.set(
         "__wasm_render",
-        Func::from(move |ctx: Ctx<'_>, guest: u32| -> JsResult<u32> {
-            let runtime = runtime
-                .upgrade()
-                .ok_or_else(|| js_error::type_error(&ctx, "the shell runtime is gone"))?;
-            let guest = REGISTRY
-                .with(|registry| {
-                    registry
-                        .borrow()
-                        .guests
-                        .get(guest as usize)
-                        .cloned()
-                        .flatten()
-                })
-                .ok_or_else(|| js_error::type_error(&ctx, "unknown wasm guest"))?;
-            let description = guest
-                .render()
-                .map_err(|error| js_error::type_error(&ctx, &format!("{error:#}")))?;
-            // The view class wraps the id as `{ __id }`, the element shape
-            // `render` is expected to return.
-            Ok(record(&ctx, &runtime, &guest, &description)? as u32)
-        }),
+        Func::from(
+            move |ctx: Ctx<'_>, guest: u32, part: u32| -> JsResult<u32> {
+                let runtime = runtime
+                    .upgrade()
+                    .ok_or_else(|| js_error::type_error(&ctx, "the shell runtime is gone"))?;
+                let guest = REGISTRY
+                    .with(|registry| {
+                        registry
+                            .borrow()
+                            .guests
+                            .get(guest as usize)
+                            .cloned()
+                            .flatten()
+                    })
+                    .ok_or_else(|| js_error::type_error(&ctx, "unknown wasm guest"))?;
+                let description = guest
+                    .render(part)
+                    .map_err(|error| js_error::type_error(&ctx, &format!("{error:#}")))?;
+                // The view class wraps the id as `{ __id }`, the element shape
+                // `render` is expected to return.
+                Ok(record(&ctx, &runtime, &guest, &description)? as u32)
+            },
+        ),
     )?;
     Ok(())
 }
@@ -222,6 +236,7 @@ fn record(
                     crate::spec::RegisteredComponentSpec::new(component_id, name, payload),
                 ))
             }
+            abi::Component::Nested(part) => nested_view(ctx, runtime, guest, *part)?,
             other => runtime.push_component(component(other)),
         };
         ids.push(id);
@@ -494,7 +509,9 @@ fn component(component: &abi::Component) -> Component {
         abi::Component::Button(id) => Component::Button(id.clone()),
         abi::Component::Checkbox(id) => Component::Checkbox(id.clone()),
         abi::Component::Input(handle) => Component::Input(EntityHandle::from(*handle)),
-        abi::Component::Registered { .. } => unreachable!("recorded by `record`"),
+        abi::Component::Registered { .. } | abi::Component::Nested(_) => {
+            unreachable!("recorded by `record`")
+        }
     }
 }
 
@@ -533,18 +550,21 @@ fn register(
     callback: u32,
 ) -> JsResult<crate::spec::CallbackId> {
     let guest = Rc::downgrade(guest);
+    let handler_runtime = Rc::downgrade(runtime);
     let function = Function::new(
         ctx.clone(),
         move |event: rquickjs::function::Opt<Value<'_>>| -> JsResult<()> {
-            let payload = match event.0 {
+            let (payload, ctx) = match event.0 {
                 Some(value) => {
                     let ctx = value.ctx().clone();
-                    ctx.json_stringify(value)?
+                    let payload = ctx
+                        .json_stringify(value)?
                         .map(|text| text.to_string())
                         .transpose()?
-                        .unwrap_or_else(|| "null".to_owned())
+                        .unwrap_or_else(|| "null".to_owned());
+                    (payload, Some(ctx))
                 }
-                None => "null".to_owned(),
+                None => ("null".to_owned(), None),
             };
             let Some(guest) = guest.upgrade() else {
                 return Ok(());
@@ -552,9 +572,12 @@ fn register(
             // A guest trap is logged rather than rethrown: the caller is the
             // host's own dispatch, which has no script to report it to.
             match guest.dispatch(callback, payload.as_bytes()) {
-                Ok(true) => refresh_current_view(),
+                Ok(true) => refresh_guest(&guest),
                 Ok(false) => {}
                 Err(error) => tracing::error!("wasm guest handler failed: {error:#}"),
+            }
+            if let (Some(ctx), Some(runtime)) = (ctx, handler_runtime.upgrade()) {
+                open_pending_dialogs(&ctx, &runtime, &guest)?;
             }
             Ok(())
         },
@@ -568,24 +591,140 @@ fn register(
     }))
 }
 
-/// What a script's `cx.notify()` does for its own view: invalidate the
-/// description and let GPUI schedule the frame.
-fn refresh_current_view() {
-    if let Some(view) = scope::current_view() {
-        scope::with_current_app(|app| view.update(app, |view, cx| view.refresh(cx)));
+/// What a script's `cx.notify()` does for its own view — invalidate the
+/// description and let GPUI schedule the frame — for every view showing the
+/// guest: its root and each part, since they all read the same guest state.
+fn refresh_guest(guest: &Guest) {
+    let views: Vec<_> = guest
+        .views
+        .borrow()
+        .iter()
+        .filter_map(WeakEntity::upgrade)
+        .collect();
+    let views = if views.is_empty() {
+        scope::current_view().into_iter().collect()
+    } else {
+        views
+    };
+    scope::with_current_app(|app| {
+        for view in views {
+            view.update(app, |view, cx| view.refresh(cx));
+        }
+    });
+}
+
+fn guest_by_id(id: u32) -> Option<Rc<Guest>> {
+    REGISTRY.with(|registry| registry.borrow().guests.get(id as usize).cloned().flatten())
+}
+
+/// A view showing one of the guest's parts, through the generated part view
+/// class. `nested_in` is the view it is drawn inside, for a child view; a
+/// dialog's view is a root of its own.
+fn part_view(
+    ctx: &Ctx<'_>,
+    runtime: &Rc<ShellRuntime>,
+    guest: &Guest,
+    part: u32,
+    nested_in: Option<gpui::EntityId>,
+) -> JsResult<Entity<ScriptView>> {
+    let factory: Function = ctx.globals().get("__wasm_part_view")?;
+    let object: rquickjs::Object = factory.call((guest.id.get(), part))?;
+    let object = super::ViewObject::unscoped(Persistent::save(ctx, object));
+    let policy = scope::policy();
+    let runtime = runtime.clone();
+    let view = scope::with_current_app(move |cx| {
+        cx.new(|_| match nested_in {
+            Some(parent) => ScriptView::nested(runtime, object, policy, parent),
+            None => ScriptView::with_policy(runtime, object, policy),
+        })
+    })
+    .ok_or_else(|| js_error::type_error(ctx, "a part view needs a live host call"))?;
+    guest.views.borrow_mut().push(view.downgrade());
+    Ok(view)
+}
+
+/// Records a part drawn in place: a child view, made once per part and kept,
+/// so the part keeps its own invalidation across the parent's renders.
+fn nested_view(
+    ctx: &Ctx<'_>,
+    runtime: &Rc<ShellRuntime>,
+    guest: &Rc<Guest>,
+    part: u32,
+) -> JsResult<SpecId> {
+    let fail = |message: &str| js_error::type_error(ctx, message);
+    let existing = guest
+        .nested
+        .borrow()
+        .get(&part)
+        .copied()
+        .and_then(|handle| runtime.entities().view(handle).map(|view| (handle, view)));
+    let (handle, view) = match existing {
+        Some(found) => found,
+        None => {
+            let parent = scope::current_view()
+                .map(|view| view.entity_id())
+                .ok_or_else(|| fail("a nested part needs a view to be drawn in"))?;
+            let view = part_view(ctx, runtime, guest, part, Some(parent))?;
+            let handle = runtime
+                .entities()
+                .create_view(
+                    view.clone(),
+                    scope::current_application_generation(),
+                    runtime,
+                )
+                .map_err(|_| fail("too many retained entities"))?;
+            guest.nested.borrow_mut().insert(part, handle);
+            (handle, view)
+        }
+    };
+    runtime
+        .arena_mut()
+        .push_child_view(crate::spec::ChildViewSpec::new(handle, view))
+        .map_err(|error| fail(&error.to_string()))
+}
+
+/// Opens the dialogs the guest asked for. A dialog's content is a view, and
+/// making one needs the JavaScript context, which a module import does not
+/// have; the request waits in the guest until a caller that has it gets here.
+fn open_pending_dialogs(ctx: &Ctx<'_>, runtime: &Rc<ShellRuntime>, guest: &Guest) -> JsResult<()> {
+    let pending = std::mem::take(&mut *guest.pending_dialogs.borrow_mut());
+    for part in pending {
+        let view = part_view(ctx, runtime, guest, part, None)?;
+        let opened = scope::with_current(|window, app| {
+            crate::ShellRoot::update(window, app, |root, window, cx| {
+                root.open_dialog_with(view.into(), crate::DialogOptions::default(), window, cx)
+            })
+        })
+        .flatten();
+        if opened.is_none() {
+            return Err(js_error::type_error(
+                ctx,
+                "open_dialog found no ShellRoot in this window; open dialogs from a handler",
+            ));
+        }
     }
+    Ok(())
 }
 
 /// One instantiated guest module.
 struct Guest {
     store: RefCell<Store<HostState>>,
     memory: Memory,
-    render: TypedFunc<(), u64>,
+    render: TypedFunc<u32, u64>,
     dispatch: TypedFunc<(u32, u32, u32), u32>,
     alloc: TypedFunc<u32, u32>,
     /// The application generation the guest belongs to; [`release`] drops it
     /// with that generation.
     application: Option<Rc<ApplicationGeneration>>,
+    /// The guest's id in the registry, which the part view class carries.
+    id: std::cell::Cell<u32>,
+    /// Every view showing the guest — its root and its parts — so a notify
+    /// re-renders all of them.
+    views: RefCell<Vec<WeakEntity<ScriptView>>>,
+    /// The child view each nested part is drawn through, by part.
+    nested: RefCell<HashMap<u32, EntityHandle>>,
+    /// Parts the guest asked to open as dialogs, not yet opened.
+    pending_dialogs: RefCell<Vec<u32>>,
 }
 
 struct HostState {
@@ -643,6 +782,15 @@ impl Guest {
             dispatch,
             alloc,
             application: scope::current_application_generation(),
+            id: std::cell::Cell::new(0),
+            views: RefCell::new(
+                scope::current_view()
+                    .map(|view| view.downgrade())
+                    .into_iter()
+                    .collect(),
+            ),
+            nested: RefCell::new(HashMap::new()),
+            pending_dialogs: RefCell::new(Vec::new()),
         });
         guest.store.borrow_mut().data_mut().guest = Rc::downgrade(&guest);
 
@@ -653,17 +801,19 @@ impl Guest {
 
         let id = REGISTRY.with(|registry| {
             let mut registry = registry.borrow_mut();
-            registry.guests.push(Some(guest));
+            registry.guests.push(Some(guest.clone()));
             registry.guests.len() - 1
         });
+        guest.id.set(id as u32);
         Ok(id as u32)
     }
 
-    fn render(&self) -> Result<Description> {
+    /// Renders the guest's view (`part` 0) or one of its parts.
+    fn render(&self, part: u32) -> Result<Description> {
         let mut store = self.store.borrow_mut();
         let packed = self
             .render
-            .call(&mut *store, ())
+            .call(&mut *store, part)
             .map_err(|error| anyhow!("guest render failed: {error:#}"))?;
         let bytes = read(&self.memory, &*store, packed)?;
         postcard::from_bytes(&bytes).context("guest returned a malformed description")
@@ -709,9 +859,15 @@ impl Guest {
         let (_guard, _generation) =
             scope::enter_runtime(&runtime, window, app, ScopePhase::Event, view);
         match self.dispatch(callback, payload) {
-            Ok(true) => refresh_current_view(),
+            Ok(true) => refresh_guest(self),
             Ok(false) => {}
             Err(error) => tracing::error!("wasm guest handler failed: {error:#}"),
+        }
+        // No script call is running here, so the context is free to open.
+        if !self.pending_dialogs.borrow().is_empty()
+            && let Err(error) = runtime.with_js(|ctx| open_pending_dialogs(ctx, &runtime, self))
+        {
+            tracing::error!("wasm guest dialog failed: {error:#}");
         }
     }
 }
@@ -976,6 +1132,26 @@ fn get_method() -> String {
     "GET".to_owned()
 }
 
+/// A toast a guest asks for, as JSON.
+#[derive(serde::Deserialize)]
+struct GuestToast {
+    title: String,
+    description: Option<String>,
+    level: Option<String>,
+}
+
+/// Overlays change only while handling an event or a task, as a script's do.
+fn ensure_overlay_phase(api: &str) -> Result<()> {
+    let phase = scope::current_phase();
+    anyhow::ensure!(
+        phase.is_some_and(ScopePhase::allows_notify),
+        "{api} is not allowed during the `{}` phase; overlays may only be opened or \
+         closed while handling an event or a task",
+        phase.map(ScopePhase::as_str).unwrap_or("none")
+    );
+    Ok(())
+}
+
 /// A process a guest asks to run, as JSON.
 #[derive(serde::Deserialize)]
 struct GuestProcess {
@@ -1165,6 +1341,62 @@ fn link_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     Err(error) => serde_json::json!({ "error": error }),
                 }
             })
+        },
+    )?;
+    // Overlays, from a handler or a task only, as a script's are.
+    linker.func_wrap(
+        module,
+        abi::import::OPEN_DIALOG,
+        |caller: Caller<'_, HostState>, part: u32| -> Result<()> {
+            ensure_overlay_phase("open_dialog")?;
+            let guest = caller
+                .data()
+                .guest
+                .upgrade()
+                .ok_or_else(|| anyhow!("the guest is gone"))?;
+            guest.pending_dialogs.borrow_mut().push(part);
+            Ok(())
+        },
+    )?;
+    linker.func_wrap(
+        module,
+        abi::import::CLOSE_DIALOG,
+        |_caller: Caller<'_, HostState>| -> Result<()> {
+            ensure_overlay_phase("close_dialog")?;
+            scope::with_current(|window, app| {
+                crate::ShellRoot::update(window, app, |root, window, cx| {
+                    root.close_dialog(window, cx)
+                })
+            })
+            .flatten()
+            .map(|_| ())
+            .ok_or_else(|| anyhow!("close_dialog found no ShellRoot in this window"))
+        },
+    )?;
+    linker.func_wrap(
+        module,
+        abi::import::PUSH_TOAST,
+        |mut caller: Caller<'_, HostState>, toast_ptr: u32, toast_len: u32| -> Result<()> {
+            ensure_overlay_phase("push_toast")?;
+            let toast: GuestToast =
+                serde_json::from_slice(&read_bytes(&mut caller, toast_ptr, toast_len)?)?;
+            let level = match toast.level.as_deref() {
+                Some("success") => crate::ToastLevel::Success,
+                Some("warning") => crate::ToastLevel::Warning,
+                Some("error") => crate::ToastLevel::Error,
+                _ => crate::ToastLevel::Info,
+            };
+            let mut request = crate::ToastRequest::new(toast.title).with_level(level);
+            if let Some(description) = toast.description {
+                request = request.with_description(description);
+            }
+            scope::with_current(|window, app| {
+                crate::ShellRoot::update(window, app, |root, window, cx| {
+                    root.push_toast(request, window, cx)
+                })
+            })
+            .flatten()
+            .ok_or_else(|| anyhow!("push_toast found no ShellRoot in this window"))
         },
     )?;
     // Session storage: the policy's in-memory store, which a script's
@@ -1586,22 +1818,11 @@ mod tests {
         directory
     }
 
-    struct Mounted(Entity<crate::ShellRoot>);
-
-    impl gpui::Render for Mounted {
-        fn render(
-            &mut self,
-            _: &mut Window,
-            _: &mut gpui::Context<Self>,
-        ) -> impl gpui::IntoElement {
-            self.0.clone()
-        }
-    }
-
     struct Harness {
         context: VisualTestContext,
         runtime: Rc<ShellRuntime>,
         view: Entity<ScriptView>,
+        root: Entity<crate::ShellRoot>,
     }
 
     impl Harness {
@@ -1617,11 +1838,20 @@ mod tests {
             let runtime = cx
                 .update(|cx| ShellRuntime::new_with_components(cx, components))
                 .expect("runtime");
-            let window = cx.add_window(|_, _| gpui::Empty);
+            // The loaded root *is* the window's root, as the shipped command
+            // opens it: overlays look for it there.
+            let load_runtime = runtime.clone();
+            let window = cx
+                .update(|cx| {
+                    cx.open_window(gpui::WindowOptions::default(), move |window, cx| {
+                        load_runtime
+                            .try_load(&directory, window, cx)
+                            .expect("the guest loads through its manifest")
+                    })
+                })
+                .expect("a window");
             let mut context = VisualTestContext::from_window(*window.deref(), cx);
-            let root = context
-                .update(|window, cx| runtime.try_load(&directory, window, cx))
-                .expect("the guest loads through its manifest");
+            let root = window.root(&mut context).expect("the window's root");
             let view = context.update(|_, cx| {
                 root.read(cx)
                     .content()
@@ -1629,15 +1859,11 @@ mod tests {
                     .downcast::<ScriptView>()
                     .expect("a guest mounts as a script view")
             });
-            // Mount the loaded root so drawing the window builds snapshots.
-            let mounted = root.clone();
-            context.update(|window, cx| {
-                window.replace_root(cx, |_, _| Mounted(mounted));
-            });
             let mut harness = Self {
                 context,
                 runtime,
                 view,
+                root,
             };
             harness.settle();
             harness
@@ -1651,6 +1877,11 @@ mod tests {
 
         fn tree(&mut self) -> String {
             let view = self.view.clone();
+            self.tree_of(&view)
+        }
+
+        fn tree_of(&mut self, view: &Entity<ScriptView>) -> String {
+            let view = view.clone();
             self.context.update(|_, cx| {
                 view.read(cx)
                     .snapshot()
@@ -1662,6 +1893,15 @@ mod tests {
         /// The first node the predicate accepts in the published description.
         fn find<T>(&mut self, pick: impl Fn(&SpecNode) -> Option<T>) -> T {
             let view = self.view.clone();
+            self.find_in(&view, pick)
+        }
+
+        fn find_in<T>(
+            &mut self,
+            view: &Entity<ScriptView>,
+            pick: impl Fn(&SpecNode) -> Option<T>,
+        ) -> T {
+            let view = view.clone();
             self.context.update(|_, cx| {
                 let view = view.read(cx);
                 let snapshot = view.snapshot().expect("a published snapshot");
@@ -1674,8 +1914,18 @@ mod tests {
         }
 
         fn handler(&mut self, element: &str, event: &'static str) -> crate::spec::CallbackId {
+            let view = self.view.clone();
+            self.handler_in(&view, element, event)
+        }
+
+        fn handler_in(
+            &mut self,
+            view: &Entity<ScriptView>,
+            element: &str,
+            event: &'static str,
+        ) -> crate::spec::CallbackId {
             let element = element.to_owned();
-            self.find(move |node| {
+            self.find_in(view, move |node| {
                 let id = match node.component()? {
                     Component::Button(id) | Component::Checkbox(id) => id,
                     _ => return None,
@@ -1817,6 +2067,76 @@ mod tests {
             runtime.release_application_generation(&application, cx);
         });
         assert_eq!(live_guests(), live - 1);
+    }
+
+    /// Every live view showing guest `id` other than its root: its parts.
+    fn part_views(
+        cx: &mut VisualTestContext,
+        root: &Entity<ScriptView>,
+    ) -> Vec<Entity<ScriptView>> {
+        let root = root.entity_id();
+        let views: Vec<_> = REGISTRY.with(|registry| {
+            registry
+                .borrow()
+                .guests
+                .iter()
+                .flatten()
+                .flat_map(|guest| guest.views.borrow().clone())
+                .collect()
+        });
+        cx.update(|_, _| {
+            views
+                .iter()
+                .filter_map(WeakEntity::upgrade)
+                .filter(|view| view.entity_id() != root)
+                .collect()
+        })
+    }
+
+    #[gpui::test]
+    fn a_guest_nests_parts_opens_dialogs_and_pushes_toasts(cx: &mut TestAppContext) {
+        let mut app = Harness::load_example(cx, "wasm_parts");
+        let tree = app.tree();
+        assert!(tree.contains("Total: 0"), "{tree}");
+
+        // The counter is a child view of its own, with its own description.
+        let parts = part_views(&mut app.context, &app.view);
+        assert_eq!(parts.len(), 1, "one nested part");
+        let counter = parts[0].clone();
+        let counter_tree = app.tree_of(&counter);
+        assert!(counter_tree.contains("Count: 0"), "{counter_tree}");
+
+        // A handler in the part changes shared state; every view re-renders.
+        let bump = app.handler_in(&counter, "bump", "on_click");
+        app.dispatch_click(bump);
+        let counter_tree = app.tree_of(&counter);
+        assert!(counter_tree.contains("Count: 1"), "{counter_tree}");
+        let tree = app.tree();
+        assert!(tree.contains("Total: 1"), "{tree}");
+
+        // A part opened as a dialog over the window.
+        app.click("open");
+        let root = app.root.clone();
+        let dialogs = app.context.update(|_, cx| root.read(cx).dialog_count());
+        assert_eq!(dialogs, 1);
+        let dialog = part_views(&mut app.context, &app.view)
+            .into_iter()
+            .find(|view| view.entity_id() != counter.entity_id())
+            .expect("the dialog's view");
+        app.settle();
+        let dialog_tree = app.tree_of(&dialog);
+        assert!(dialog_tree.contains("Reset 1?"), "{dialog_tree}");
+
+        // Its handler resets the count, closes itself and pushes a toast.
+        let reset = app.handler_in(&dialog, "reset", "on_click");
+        app.dispatch_click(reset);
+        let (dialogs, toasts) = app
+            .context
+            .update(|_, cx| (root.read(cx).dialog_count(), root.read(cx).toast_count()));
+        assert_eq!(dialogs, 0);
+        assert_eq!(toasts, 1);
+        let tree = app.tree();
+        assert!(tree.contains("Total: 0"), "{tree}");
     }
 
     #[gpui::test]
@@ -2353,7 +2673,7 @@ export default class Grid extends View {
         });
         let mut bytes = 0;
         let guest_only = best_per_call(|| {
-            let description = instance.render().expect("render");
+            let description = instance.render(0).expect("render");
             bytes = postcard::to_allocvec(&description).unwrap().len();
         });
 
