@@ -14,19 +14,22 @@
 //! functions that call the guest's `dispatch` export, so every dispatch path
 //! (`dispatch_click`, `dispatch_change`, ...) reaches a guest without change.
 //!
-//! What a guest reaches: the `gpui-base` elements, state styles, registered
-//! components (validated against their schemas like a script's arguments)
-//! and their retained state (methods and input events), the persistent
-//! store, files and HTTP GET under the application's capabilities. Modules
-//! and instances are released with their application generation.
+//! What a guest reaches: the `gpui-base` elements, state styles, named slots,
+//! registered components (validated against their schemas like a script's
+//! arguments) and their retained state (methods and input events); and,
+//! under the application's capabilities, the persistent and session stores,
+//! the clipboard, files, processes and HTTP. Calls a script makes
+//! asynchronously are asynchronous here too, callback-style (a core module
+//! has no promise to settle): the work runs on the background executor and
+//! the handler back on the main thread. Store writes reach the disk the same
+//! way. Modules and instances are released with their application generation.
 //!
 //! Known gaps, deliberately left for after the spike:
 //!
-//! * Storage and file calls run on the main thread; a script's run on a
-//!   blocking task. HTTP is asynchronous (callback-style: a core module has
-//!   no promise to settle) but GET only.
-//! * Not reachable yet: slots, virtualized lists, nested views, session
-//!   storage, processes, the clipboard, sockets, overlays and the dock.
+//! * Not reachable yet: virtualized lists, nested views, sockets, streamed
+//!   processes, overlays (dialogs, sheets, toasts) and the dock. Each needs
+//!   a guest-side shape of its own (a renderer called during layout, a
+//!   child guest, a stream of events, a window-level surface).
 //! * The JavaScript engine still hosts every guest (a generated view class
 //!   per module); this is a guest *kind* next to scripts, not a second engine.
 //! * Descriptions cross as postcard; handler payloads as JSON. The grid test
@@ -259,6 +262,15 @@ fn record(
                         other => return Err(fail(format!("unsupported handler `{other}`"))),
                     };
                     SpecOp::Callback(name, register(ctx, runtime, guest, *callback)?)
+                }
+                Op::Slot(name, index) => {
+                    let element = *ids.get(*index as usize).ok_or_else(|| {
+                        fail(format!("slot element {index} comes after its user"))
+                    })?;
+                    // The script path's own: it checks the slot name, claims
+                    // the element and records the op.
+                    runtime.fill_slot(ctx, id, name, element)?;
+                    continue;
                 }
                 Op::StateStyle(name, index) => {
                     let name = match name.as_str() {
@@ -863,30 +875,113 @@ fn with_local_storage<R>(body: impl FnOnce(&mut crate::storage::Storage) -> R) -
     })
 }
 
-/// Writes the store's pending revision before returning.
+/// Schedules the store's pending revision to reach the disk.
 ///
-/// A script's writes are persisted off the main thread by the scheduler,
-/// which a module import cannot reach; the spike writes synchronously
-/// instead, through the store's own write queue so the two never interleave.
+/// The cache already answered; the write happens on the background executor,
+/// one at a time through the store's own queue (as a script's do), and each
+/// completion drives the queue again so a `set` made while a write was in
+/// flight is picked up by the next one.
 fn persist_local_storage() -> Result<()> {
     let policy = scope::policy();
-    while let Some(Some(pending)) = policy.with_local_storage(crate::storage::Storage::begin_write)
-    {
-        let revision = pending.revision();
-        let (path, body) = pending.into_parts();
-        let result = crate::storage::persist(&path, body);
-        let failed = result.clone().err();
-        let woken = policy
-            .with_local_storage(|store| store.finish_write(revision, result))
-            .unwrap_or_default();
-        for wake in woken {
-            wake();
-        }
-        if let Some(error) = failed {
-            anyhow::bail!("storage write failed: {error}");
-        }
+    scope::with_current_app(|cx| drive_store(policy, cx))
+        .ok_or_else(|| anyhow!("storage writes need a live host call"))
+}
+
+fn drive_store(policy: Rc<crate::policy::Policy>, cx: &mut App) {
+    let stalled = policy
+        .with_local_storage(crate::storage::Storage::take_stalled)
+        .unwrap_or_default();
+    for wake in stalled {
+        wake();
     }
-    Ok(())
+    let Some(Some(pending)) = policy.with_local_storage(crate::storage::Storage::begin_write)
+    else {
+        return;
+    };
+    let revision = pending.revision();
+    let (path, body) = pending.into_parts();
+    cx.spawn(async move |cx| {
+        let result = cx
+            .background_executor()
+            .spawn(async move { crate::storage::persist(&path, body) })
+            .await;
+        if let Err(error) = &result {
+            tracing::error!("wasm guest storage write failed: {error}");
+        }
+        cx.update(|cx| {
+            let woken = policy
+                .with_local_storage(|store| store.finish_write(revision, result))
+                .unwrap_or_default();
+            for wake in woken {
+                wake();
+            }
+            drive_store(policy, cx);
+        });
+    })
+    .detach();
+}
+
+/// Runs `work` on the background executor and hands its JSON result to the
+/// guest's handler `callback` back on the main thread — the shape of every
+/// asynchronous import, since a core module has no promise to settle. A guest
+/// released while the work was in flight (its application retired) is simply
+/// not called.
+fn run_in_background(
+    guest: Weak<Guest>,
+    callback: u32,
+    work: impl FnOnce() -> serde_json::Value + Send + 'static,
+) -> Result<()> {
+    scope::with_current(|window, cx| {
+        window
+            .spawn(cx, async move |cx| {
+                let payload = cx
+                    .background_executor()
+                    .spawn(async move { work() })
+                    .await
+                    .to_string();
+                let _ = cx.update(|window, app| {
+                    if let Some(guest) = guest.upgrade() {
+                        guest.dispatch_native_with(callback, payload.as_bytes(), window, app);
+                    }
+                });
+            })
+            .detach();
+    })
+    .ok_or_else(|| anyhow!("an asynchronous call needs a live host call"))
+}
+
+fn http_result(result: std::result::Result<(u16, Vec<u8>), String>) -> serde_json::Value {
+    match result {
+        Ok((status, body)) => serde_json::json!({
+            "status": status,
+            "body": String::from_utf8_lossy(&body),
+        }),
+        Err(error) => serde_json::json!({ "error": error }),
+    }
+}
+
+/// An HTTP request a guest describes as JSON.
+#[derive(serde::Deserialize)]
+struct GuestHttpRequest {
+    #[serde(default = "get_method")]
+    method: String,
+    url: String,
+    #[serde(default)]
+    headers: Vec<(String, String)>,
+    #[serde(default)]
+    body: String,
+}
+
+fn get_method() -> String {
+    "GET".to_owned()
+}
+
+/// A process a guest asks to run, as JSON.
+#[derive(serde::Deserialize)]
+struct GuestProcess {
+    command: String,
+    #[serde(default)]
+    args: Vec<String>,
 }
 
 fn state_descriptor(runtime: &ShellRuntime, export: &str) -> Result<crate::StateDescriptor> {
@@ -1005,40 +1100,200 @@ fn link_imports(linker: &mut Linker<HostState>) -> Result<()> {
          -> Result<()> {
             let url = read_string(&mut caller, url_ptr, url_len)?;
             let capabilities = scope::policy().capabilities().clone();
-            let url = super::standard::fetch::authorized_get(&capabilities, &url)
-                .map_err(|error| anyhow!(error))?;
-            let guest = caller.data().guest.clone();
-            scope::with_current(|window, cx| {
-                window
-                    .spawn(cx, async move |cx| {
-                        let result = cx
-                            .background_executor()
-                            .spawn(async move { super::standard::fetch::get(capabilities, url) })
-                            .await;
-                        let payload = match result {
-                            Ok((status, body)) => serde_json::json!({
-                                "status": status,
-                                "body": String::from_utf8_lossy(&body),
-                            }),
-                            Err(error) => serde_json::json!({ "error": error }),
-                        }
-                        .to_string();
-                        // A guest released while the request was in flight
-                        // (its application retired) is simply not called.
-                        let _ = cx.update(|window, app| {
-                            if let Some(guest) = guest.upgrade() {
-                                guest.dispatch_native_with(
-                                    callback,
-                                    payload.as_bytes(),
-                                    window,
-                                    app,
-                                );
-                            }
-                        });
-                    })
-                    .detach();
+            let request =
+                super::standard::fetch::authorize(&capabilities, "GET", &url, &[], Vec::new())
+                    .map_err(|error| anyhow!(error))?;
+            run_in_background(caller.data().guest.clone(), callback, move || {
+                http_result(super::standard::fetch::send(capabilities, request))
             })
-            .ok_or_else(|| anyhow!("http_get needs a live host call"))
+        },
+    )?;
+    linker.func_wrap(
+        module,
+        abi::import::HTTP_REQUEST,
+        |mut caller: Caller<'_, HostState>,
+         request_ptr: u32,
+         request_len: u32,
+         callback: u32|
+         -> Result<()> {
+            let request: GuestHttpRequest =
+                serde_json::from_slice(&read_bytes(&mut caller, request_ptr, request_len)?)?;
+            let capabilities = scope::policy().capabilities().clone();
+            let request = super::standard::fetch::authorize(
+                &capabilities,
+                &request.method,
+                &request.url,
+                &request.headers,
+                request.body.into_bytes(),
+            )
+            .map_err(|error| anyhow!(error))?;
+            run_in_background(caller.data().guest.clone(), callback, move || {
+                http_result(super::standard::fetch::send(capabilities, request))
+            })
+        },
+    )?;
+    // Processes: the same bounded runner and execute grant a script's
+    // `process.run` uses, off the main thread.
+    linker.func_wrap(
+        module,
+        abi::import::PROCESS_RUN,
+        |mut caller: Caller<'_, HostState>,
+         request_ptr: u32,
+         request_len: u32,
+         callback: u32|
+         -> Result<()> {
+            let request: GuestProcess =
+                serde_json::from_slice(&read_bytes(&mut caller, request_ptr, request_len)?)?;
+            anyhow::ensure!(
+                scope::policy().capabilities().may_run(&request.command),
+                "{}",
+                crate::capability::CapabilityError::ExecuteDenied(request.command.clone())
+            );
+            run_in_background(caller.data().guest.clone(), callback, move || {
+                match crate::process::run_bounded(
+                    &request.command,
+                    &request.args,
+                    None,
+                    crate::process::Limits::default(),
+                    crate::process::Cancellation::new(),
+                ) {
+                    Ok(output) => serde_json::json!({
+                        "code": output.code,
+                        "stdout": output.stdout,
+                        "stderr": output.stderr,
+                    }),
+                    Err(error) => serde_json::json!({ "error": error }),
+                }
+            })
+        },
+    )?;
+    // Session storage: the policy's in-memory store, which a script's
+    // `sessionStorage` reaches without a capability.
+    linker.func_wrap(
+        module,
+        abi::import::SESSION_GET,
+        |mut caller: Caller<'_, HostState>, key_ptr: u32, key_len: u32| -> Result<u64> {
+            let key = read_string(&mut caller, key_ptr, key_len)?;
+            let value = scope::policy()
+                .with_session_storage(|store| {
+                    store.values().map(|values| {
+                        values.get(&key).map(|value| match value {
+                            serde_json::Value::String(text) => text.clone(),
+                            other => other.to_string(),
+                        })
+                    })
+                })
+                .ok_or_else(|| anyhow!("no session storage"))?
+                .map_err(|error| anyhow!(error))?;
+            match value {
+                Some(value) => write_string(&mut caller, &value),
+                None => Ok(abi::ABSENT),
+            }
+        },
+    )?;
+    linker.func_wrap(
+        module,
+        abi::import::SESSION_SET,
+        |mut caller: Caller<'_, HostState>,
+         key_ptr: u32,
+         key_len: u32,
+         value_ptr: u32,
+         value_len: u32|
+         -> Result<()> {
+            let key = read_string(&mut caller, key_ptr, key_len)?;
+            let value = read_string(&mut caller, value_ptr, value_len)?;
+            scope::policy()
+                .with_session_storage(|store| store.set(key, serde_json::Value::String(value)))
+                .ok_or_else(|| anyhow!("no session storage"))?
+                .map_err(|error| anyhow!(error))
+        },
+    )?;
+    // The clipboard, under its read and write grants.
+    linker.func_wrap(
+        module,
+        abi::import::CLIPBOARD_READ,
+        |mut caller: Caller<'_, HostState>| -> Result<u64> {
+            anyhow::ensure!(
+                scope::policy().capabilities().is_clipboard_readable(),
+                "{}",
+                super::host::CLIPBOARD_READ_DENIED
+            );
+            let text =
+                scope::with_current_app(|cx| cx.read_from_clipboard().and_then(|item| item.text()))
+                    .ok_or_else(|| anyhow!("clipboard_read needs a live host call"))?;
+            match text {
+                Some(text) => write_string(&mut caller, &text),
+                None => Ok(abi::ABSENT),
+            }
+        },
+    )?;
+    linker.func_wrap(
+        module,
+        abi::import::CLIPBOARD_WRITE,
+        |mut caller: Caller<'_, HostState>, text_ptr: u32, text_len: u32| -> Result<()> {
+            anyhow::ensure!(
+                scope::policy().capabilities().is_clipboard_writable(),
+                "{}",
+                super::host::CLIPBOARD_WRITE_DENIED
+            );
+            let text = read_string(&mut caller, text_ptr, text_len)?;
+            scope::with_current_app(|cx| {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(text))
+            })
+            .ok_or_else(|| anyhow!("clipboard_write needs a live host call"))
+        },
+    )?;
+    // Asynchronous files: the grant is resolved here, the I/O on the
+    // background executor through the directory handle it opened.
+    linker.func_wrap(
+        module,
+        abi::import::FS_READ_TEXT_ASYNC,
+        |mut caller: Caller<'_, HostState>,
+         path_ptr: u32,
+         path_len: u32,
+         callback: u32|
+         -> Result<()> {
+            let path = read_string(&mut caller, path_ptr, path_len)?;
+            let grant = scope::policy()
+                .capabilities()
+                .open(Path::new(&path), crate::capability::Access::Read)
+                .map_err(|error| anyhow!("{error}"))?;
+            let (dir, relative) = grant.into_parts();
+            run_in_background(caller.data().guest.clone(), callback, move || {
+                match dir.read_to_string(&relative) {
+                    Ok(text) => serde_json::json!({ "text": text }),
+                    Err(error) => {
+                        serde_json::json!({ "error": format!("cannot read `{path}`: {error}") })
+                    }
+                }
+            })
+        },
+    )?;
+    linker.func_wrap(
+        module,
+        abi::import::FS_WRITE_TEXT_ASYNC,
+        |mut caller: Caller<'_, HostState>,
+         path_ptr: u32,
+         path_len: u32,
+         text_ptr: u32,
+         text_len: u32,
+         callback: u32|
+         -> Result<()> {
+            let path = read_string(&mut caller, path_ptr, path_len)?;
+            let text = read_bytes(&mut caller, text_ptr, text_len)?;
+            let grant = scope::policy()
+                .capabilities()
+                .open(Path::new(&path), crate::capability::Access::Write)
+                .map_err(|error| anyhow!("{error}"))?;
+            let (dir, relative) = grant.into_parts();
+            run_in_background(caller.data().guest.clone(), callback, move || {
+                match dir.write(&relative, text) {
+                    Ok(()) => serde_json::json!({ "ok": true }),
+                    Err(error) => {
+                        serde_json::json!({ "error": format!("cannot write `{path}`: {error}") })
+                    }
+                }
+            })
         },
     )?;
     // Files: the same resolver a script's `fs` goes through, which opens the
@@ -1649,6 +1904,9 @@ mod tests {
         assert!(first.contains("Visits: 1"), "{first}");
         let second = start_storage_guest(cx).expect("second start");
         assert!(second.contains("Visits: 2"), "{second}");
+        // The cache answered at once; the write reaches the disk off the
+        // main thread.
+        cx.run_until_parked();
         let stored = std::fs::read_to_string(&file).expect("the store reached the disk");
         assert!(stored.contains("\"visits\""), "{stored}");
     }
@@ -1803,6 +2061,125 @@ mod tests {
         assert!(
             message.contains("HTTP request GET http://127.0.0.1:9/greeting is not granted"),
             "{message}"
+        );
+    }
+
+    /// A loopback server that answers one request with its own method and
+    /// body, and whether the guest's header arrived.
+    fn serve_echo_once() -> u16 {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 1024];
+            let header_end = loop {
+                let read = stream.read(&mut buffer).unwrap();
+                request.extend_from_slice(&buffer[..read]);
+                if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break end + 4;
+                }
+            };
+            let head = String::from_utf8_lossy(&request[..header_end]).to_ascii_lowercase();
+            let length = head
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            while request.len() < header_end + length {
+                let read = stream.read(&mut buffer).unwrap();
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let method = head
+                .split(' ')
+                .next()
+                .unwrap_or_default()
+                .to_ascii_uppercase();
+            let body = String::from_utf8_lossy(&request[header_end..header_end + length]);
+            let header = head.contains("x-guest: wasm");
+            let reply = format!("{method} {body} header={header}");
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                reply.len()
+            )
+            .unwrap();
+        });
+        port
+    }
+
+    #[gpui::test]
+    fn a_guest_reaches_the_remaining_host_services(cx: &mut TestAppContext) {
+        let port = serve_echo_once();
+        let directory = application("wasm_services");
+        let data = directory.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let data = data.canonicalize().unwrap();
+        let notes = data.join("notes.txt");
+        std::fs::write(&notes, "read off the main thread").unwrap();
+        let store = directory.join("store.json");
+        std::fs::write(
+            &store,
+            serde_json::json!({
+                "url": format!("http://127.0.0.1:{port}/echo"),
+                "notes_path": notes.to_string_lossy(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let components = crate::components::components().expect("catalog");
+        cx.update(|cx| crate::init_with_components(cx, &components));
+        crate::set_storage_path(store);
+        crate::set_capabilities(
+            crate::Capabilities::new()
+                .storage(true)
+                .network_hosts(["127.0.0.1".to_owned()])
+                .read_roots([data.clone()])
+                .write_roots([data.clone()])
+                .execute(crate::ExecuteGrant::Allowed(vec!["echo".to_owned()]))
+                .clipboard_read(true)
+                .clipboard_write(true),
+        );
+        let runtime = cx
+            .update(|cx| ShellRuntime::new_with_components(cx, components))
+            .expect("runtime");
+        let window = cx.add_window(|_, _| gpui::Empty);
+        let mut context = VisualTestContext::from_window(*window.deref(), cx);
+        let view_type = runtime.load_app(&directory, "guest.wasm").expect("load");
+        let view = context
+            .update(|window, cx| runtime.instantiate_view(&view_type, window, cx))
+            .expect("instantiate");
+
+        // The synchronous services answered in `init`, and the slot is
+        // rendered by the component rather than among its children.
+        let first = drawn_tree(&mut context, &view);
+        assert!(first.contains("Session: hello session"), "{first}");
+        assert!(first.contains("Clipboard: copied text"), "{first}");
+        assert!(first.contains("@content"), "{first}");
+
+        // The asynchronous ones fill in as their handlers run.
+        let mut tree = String::new();
+        for _ in 0..300 {
+            context.run_until_parked();
+            tree = drawn_tree(&mut context, &view);
+            if tree.contains("Http: 200")
+                && tree.contains("Process: from a process")
+                && tree.contains("Notes: read off the main thread")
+                && tree.contains("Wrote: true")
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(tree.contains("Process: from a process"), "{tree}");
+        assert!(tree.contains("Http: 200 POST ping header=true"), "{tree}");
+        assert!(tree.contains("Notes: read off the main thread"), "{tree}");
+        assert!(tree.contains("Wrote: true"), "{tree}");
+        assert_eq!(
+            std::fs::read_to_string(data.join("notes.txt.async")).unwrap(),
+            "ASYNC"
         );
     }
 

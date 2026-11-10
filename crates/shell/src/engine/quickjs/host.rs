@@ -1078,9 +1078,9 @@ fn write_to_clipboard(ctx: Ctx<'_>, text: String) -> JsResult<()> {
 
 /// Read and write are separate grants, so the denial names the half that was
 /// missing. Wording follows [`CapabilityError`].
-const CLIPBOARD_READ_DENIED: &str =
+pub(super) const CLIPBOARD_READ_DENIED: &str =
     "reading the clipboard is not granted; declare capabilities.clipboard.read in the manifest";
-const CLIPBOARD_WRITE_DENIED: &str =
+pub(super) const CLIPBOARD_WRITE_DENIED: &str =
     "writing the clipboard is not granted; declare capabilities.clipboard.write in the manifest";
 
 /// Runs `body` against GPUI's `App`.

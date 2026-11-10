@@ -85,6 +85,34 @@ pub mod import {
     /// returns at once; `callback` later receives `{"status", "body"}` or
     /// `{"error"}` as its JSON payload.
     pub const HTTP_GET: &str = "http_get";
+    /// `fn(request_ptr: u32, request_len: u32, callback: u32)`: as
+    /// [`HTTP_GET`] for any method, with a JSON request `{"method", "url",
+    /// "headers": [[name, value], ...], "body"}`.
+    pub const HTTP_REQUEST: &str = "http_request";
+    /// `fn(request_ptr: u32, request_len: u32, callback: u32)`: runs a
+    /// command the execute grant allows, from a JSON request `{"command",
+    /// "args"}`; `callback` receives `{"code", "stdout", "stderr"}` or
+    /// `{"error"}`.
+    pub const PROCESS_RUN: &str = "process_run";
+    /// `fn(path_ptr: u32, path_len: u32, callback: u32)`: [`FS_READ_TEXT`]
+    /// off the main thread; `callback` receives `{"text"}` or `{"error"}`.
+    pub const FS_READ_TEXT_ASYNC: &str = "fs_read_text_async";
+    /// `fn(path_ptr: u32, path_len: u32, text_ptr: u32, text_len: u32,
+    /// callback: u32)`: [`FS_WRITE_TEXT`] off the main thread; `callback`
+    /// receives `{"ok": true}` or `{"error"}`.
+    pub const FS_WRITE_TEXT_ASYNC: &str = "fs_write_text_async";
+    /// `fn(key_ptr: u32, key_len: u32) -> u64`: `sessionStorage.getItem`
+    /// ([`super::ABSENT`] when unset). No capability, no disk.
+    pub const SESSION_GET: &str = "session_get";
+    /// `fn(key_ptr: u32, key_len: u32, value_ptr: u32, value_len: u32)`:
+    /// `sessionStorage.setItem`.
+    pub const SESSION_SET: &str = "session_set";
+    /// `fn() -> u64`: the clipboard's text ([`super::ABSENT`] when it holds
+    /// none), under the `clipboard.read` grant.
+    pub const CLIPBOARD_READ: &str = "clipboard_read";
+    /// `fn(text_ptr: u32, text_len: u32)`: replaces the clipboard's text,
+    /// under the `clipboard.write` grant.
+    pub const CLIPBOARD_WRITE: &str = "clipboard_write";
 }
 
 /// What a lookup import returns for "no value", distinct from any packed
@@ -187,6 +215,9 @@ pub enum Op {
     /// detached node, by its index, applied while the element is in that
     /// state.
     StateStyle(String, u32),
+    /// A named element slot (`content`, `trigger`, `header`, ...): the node
+    /// at the index is rendered by the component in a place of its own.
+    Slot(String, u32),
 }
 
 /// An argument value, matching gpui-shell's neutral `Bridged` value.

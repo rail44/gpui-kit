@@ -225,32 +225,60 @@ fn authorize_request(
     }
 }
 
-/// `fetch`'s authorization for a caller that is not a script — a WebAssembly
-/// guest's `http_get`. Checked here, on the calling thread, so a denial fails
-/// the call that made it; redirects are checked again inside [`get`].
+/// A request a caller that is not a script — a WebAssembly guest — has had
+/// authorized, ready to [`send`].
 #[cfg(feature = "wasm-guest")]
-pub(in crate::engine::quickjs) fn authorized_get(
-    capabilities: &crate::Capabilities,
-    url: &str,
-) -> std::result::Result<reqwest::Url, String> {
-    let url = reqwest::Url::parse(url).map_err(|error| format!("invalid URL `{url}`: {error}"))?;
-    authorize_request(capabilities, &reqwest::Method::GET, &url)?;
-    Ok(url)
+pub(in crate::engine::quickjs) struct AuthorizedRequest {
+    url: reqwest::Url,
+    options: FetchOptions,
 }
 
-/// A GET through the same client and redirect checks as `fetch`, returning
-/// the status and body. Blocking: run it off the main thread.
+/// `fetch`'s parsing and authorization for a request that does not come from
+/// script. Run on the calling thread, so a denial fails the call that made
+/// it; redirects are authorized again inside [`send`], as `fetch`'s are.
 #[cfg(feature = "wasm-guest")]
-pub(in crate::engine::quickjs) fn get(
+pub(in crate::engine::quickjs) fn authorize(
+    capabilities: &crate::Capabilities,
+    method: &str,
+    url: &str,
+    headers: &[(String, String)],
+    body: Vec<u8>,
+) -> std::result::Result<AuthorizedRequest, String> {
+    let url = reqwest::Url::parse(url).map_err(|error| format!("invalid URL `{url}`: {error}"))?;
+    let method = reqwest::Method::from_bytes(method.to_ascii_uppercase().as_bytes())
+        .map_err(|_| format!("`{method}` is not an HTTP method"))?;
+    let mut header_map = reqwest::header::HeaderMap::new();
+    for (name, value) in headers {
+        let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+            .map_err(|_| format!("`{name}` is not a header name"))?;
+        let value = reqwest::header::HeaderValue::from_str(value)
+            .map_err(|_| format!("the `{name}` header value is not valid"))?;
+        header_map.append(name, value);
+    }
+    authorize_request(capabilities, &method, &url)?;
+    Ok(AuthorizedRequest {
+        url,
+        options: FetchOptions {
+            method,
+            headers: header_map,
+            body,
+        },
+    })
+}
+
+/// Sends an authorized request through `fetch`'s client and redirect checks,
+/// returning the status and body. Blocking: run it off the main thread.
+#[cfg(feature = "wasm-guest")]
+pub(in crate::engine::quickjs) fn send(
     capabilities: crate::Capabilities,
-    url: reqwest::Url,
+    request_: AuthorizedRequest,
 ) -> std::result::Result<(u16, Vec<u8>), String> {
     // A test talks to a loopback server, which a system proxy must not see.
     #[cfg(test)]
     let client = direct_test_client().ok();
     #[cfg(not(test))]
     let client = None;
-    request(capabilities, url, FetchOptions::default(), client)
+    request(capabilities, request_.url, request_.options, client)
         .map(|response| (response.status, response.body))
 }
 

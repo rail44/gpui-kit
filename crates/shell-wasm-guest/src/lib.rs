@@ -124,6 +124,7 @@ enum PendingOp {
     Op(Op),
     Component(String, Vec<CArg>),
     StateStyle(&'static str, Element),
+    Slot(String, Element),
 }
 
 /// An argument to a registered component, before the tree is flattened:
@@ -357,6 +358,13 @@ impl Element {
         self
     }
 
+    /// Fills a named slot the component renders in a place of its own
+    /// (`content`, `trigger`, `header`, ...), as a script's `.content(el)`.
+    pub fn slot(mut self, name: &str, element: Element) -> Self {
+        self.ops.push(PendingOp::Slot(name.to_owned(), element));
+        self
+    }
+
     /// A method the registered component declares (`label`, `primary`,
     /// `value`): `.call("label", ["Add".into()])`.
     pub fn call(mut self, name: &str, args: impl IntoIterator<Item = CArg>) -> Self {
@@ -509,6 +517,7 @@ impl Element {
                     PendingOp::StateStyle(name, styles) => {
                         Op::StateStyle(name.to_owned(), flatten(styles, nodes))
                     }
+                    PendingOp::Slot(name, element) => Op::Slot(name, flatten(element, nodes)),
                 })
                 .collect();
             let children = element
@@ -603,6 +612,37 @@ pub mod fs {
             )
         }
     }
+
+    /// [`read_text`] off the main thread: returns at once, and `f` gets
+    /// `{"text"}` or `{"error"}`. The grant is checked at the call.
+    pub fn read_text_async<V: 'static>(
+        path: &str,
+        cx: &mut super::Cx<V>,
+        f: impl Fn(&mut V, &super::Event, &mut super::Cx<V>) + 'static,
+    ) {
+        let handler = cx.listener(f);
+        unsafe { host::fs_read_text_async(path.as_ptr() as u32, path.len() as u32, handler.0) }
+    }
+
+    /// [`write_text`] off the main thread; `f` gets `{"ok": true}` or
+    /// `{"error"}`.
+    pub fn write_text_async<V: 'static>(
+        path: &str,
+        text: &str,
+        cx: &mut super::Cx<V>,
+        f: impl Fn(&mut V, &super::Event, &mut super::Cx<V>) + 'static,
+    ) {
+        let handler = cx.listener(f);
+        unsafe {
+            host::fs_write_text_async(
+                path.as_ptr() as u32,
+                path.len() as u32,
+                text.as_ptr() as u32,
+                text.len() as u32,
+                handler.0,
+            )
+        }
+    }
 }
 
 /// HTTP under the application's network grants, as a script's `fetch`.
@@ -618,6 +658,82 @@ pub mod http {
     ) {
         let handler = cx.listener(f);
         unsafe { host::http_get(url.as_ptr() as u32, url.len() as u32, handler.0) }
+    }
+
+    /// Any method, with headers and a body: `request("POST", url,
+    /// &[("content-type", "application/json")], body, cx, f)`.
+    pub fn request<V: 'static>(
+        method: &str,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: &str,
+        cx: &mut Cx<V>,
+        f: impl Fn(&mut V, &Event, &mut Cx<V>) + 'static,
+    ) {
+        let request = serde_json::json!({
+            "method": method,
+            "url": url,
+            "headers": headers,
+            "body": body,
+        })
+        .to_string();
+        let handler = cx.listener(f);
+        unsafe { host::http_request(request.as_ptr() as u32, request.len() as u32, handler.0) }
+    }
+}
+
+/// Commands under the application's execute grant, as a script's
+/// `process.run`.
+pub mod process {
+    use super::{Cx, Event, host};
+
+    /// Starts `command` and returns at once. `f` runs on the main thread with
+    /// `{"code", "stdout", "stderr"}` or `{"error"}` as its event.
+    pub fn run<V: 'static>(
+        command: &str,
+        args: &[&str],
+        cx: &mut Cx<V>,
+        f: impl Fn(&mut V, &Event, &mut Cx<V>) + 'static,
+    ) {
+        let request = serde_json::json!({ "command": command, "args": args }).to_string();
+        let handler = cx.listener(f);
+        unsafe { host::process_run(request.as_ptr() as u32, request.len() as u32, handler.0) }
+    }
+}
+
+/// This run's in-memory store: a script's `sessionStorage`. No capability,
+/// nothing reaches the disk.
+pub mod session_storage {
+    use super::host;
+
+    pub fn get(key: &str) -> Option<String> {
+        let packed = unsafe { host::session_get(key.as_ptr() as u32, key.len() as u32) };
+        (packed != crate::abi::ABSENT).then(|| super::take_string(packed))
+    }
+
+    pub fn set(key: &str, value: &str) {
+        unsafe {
+            host::session_set(
+                key.as_ptr() as u32,
+                key.len() as u32,
+                value.as_ptr() as u32,
+                value.len() as u32,
+            )
+        }
+    }
+}
+
+/// The system clipboard's text, under the `clipboard` grants.
+pub mod clipboard {
+    use super::host;
+
+    pub fn read() -> Option<String> {
+        let packed = unsafe { host::clipboard_read() };
+        (packed != crate::abi::ABSENT).then(|| super::take_string(packed))
+    }
+
+    pub fn write(text: &str) {
+        unsafe { host::clipboard_write(text.as_ptr() as u32, text.len() as u32) }
     }
 }
 
@@ -636,6 +752,20 @@ mod host {
         pub fn input_on_submit(handle: u32, callback: u32);
         pub fn log(ptr: u32, len: u32);
         pub fn http_get(url_ptr: u32, url_len: u32, callback: u32);
+        pub fn http_request(request_ptr: u32, request_len: u32, callback: u32);
+        pub fn process_run(request_ptr: u32, request_len: u32, callback: u32);
+        pub fn fs_read_text_async(path_ptr: u32, path_len: u32, callback: u32);
+        pub fn fs_write_text_async(
+            path_ptr: u32,
+            path_len: u32,
+            text_ptr: u32,
+            text_len: u32,
+            callback: u32,
+        );
+        pub fn session_get(key_ptr: u32, key_len: u32) -> u64;
+        pub fn session_set(key_ptr: u32, key_len: u32, value_ptr: u32, value_len: u32);
+        pub fn clipboard_read() -> u64;
+        pub fn clipboard_write(text_ptr: u32, text_len: u32);
         pub fn fs_read_text(path_ptr: u32, path_len: u32) -> u64;
         pub fn fs_write_text(path_ptr: u32, path_len: u32, text_ptr: u32, text_len: u32);
         pub fn storage_get(key_ptr: u32, key_len: u32) -> u64;
@@ -680,6 +810,30 @@ mod host {
     }
     pub unsafe fn log(_: u32, _: u32) {}
     pub unsafe fn http_get(_: u32, _: u32, _: u32) {
+        unimplemented!("gpui-shell host imports exist only in a wasm32 guest")
+    }
+    pub unsafe fn http_request(_: u32, _: u32, _: u32) {
+        unimplemented!("gpui-shell host imports exist only in a wasm32 guest")
+    }
+    pub unsafe fn process_run(_: u32, _: u32, _: u32) {
+        unimplemented!("gpui-shell host imports exist only in a wasm32 guest")
+    }
+    pub unsafe fn fs_read_text_async(_: u32, _: u32, _: u32) {
+        unimplemented!("gpui-shell host imports exist only in a wasm32 guest")
+    }
+    pub unsafe fn fs_write_text_async(_: u32, _: u32, _: u32, _: u32, _: u32) {
+        unimplemented!("gpui-shell host imports exist only in a wasm32 guest")
+    }
+    pub unsafe fn session_get(_: u32, _: u32) -> u64 {
+        unimplemented!("gpui-shell host imports exist only in a wasm32 guest")
+    }
+    pub unsafe fn session_set(_: u32, _: u32, _: u32, _: u32) {
+        unimplemented!("gpui-shell host imports exist only in a wasm32 guest")
+    }
+    pub unsafe fn clipboard_read() -> u64 {
+        unimplemented!("gpui-shell host imports exist only in a wasm32 guest")
+    }
+    pub unsafe fn clipboard_write(_: u32, _: u32) {
         unimplemented!("gpui-shell host imports exist only in a wasm32 guest")
     }
     pub unsafe fn fs_read_text(_: u32, _: u32) -> u64 {
