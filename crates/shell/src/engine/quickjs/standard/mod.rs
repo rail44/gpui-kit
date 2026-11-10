@@ -14,7 +14,7 @@ use rquickjs::{Ctx, Result, loader::BuiltinResolver, loader::ModuleLoader};
 mod connect;
 mod console;
 mod encoding;
-mod fetch;
+pub(in crate::engine::quickjs) mod fetch;
 mod fs;
 mod net;
 mod os;

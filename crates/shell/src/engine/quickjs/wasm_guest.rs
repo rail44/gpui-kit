@@ -14,16 +14,21 @@
 //! functions that call the guest's `dispatch` export, so every dispatch path
 //! (`dispatch_click`, `dispatch_change`, ...) reaches a guest without change.
 //!
+//! What a guest reaches: the `gpui-base` elements, state styles, registered
+//! components (validated against their schemas like a script's arguments)
+//! and their retained state (methods and input events), the persistent
+//! store, files and HTTP GET under the application's capabilities. Modules
+//! and instances are released with their application generation.
+//!
 //! Known gaps, deliberately left for after the spike:
 //!
-//! * Guest instances live in a thread-local registry and are never released
-//!   when their application generation retires (a reload leaks one).
-//! * The `gpui-base` element set and stateless registered components
-//!   (constructors and methods, element and handler arguments) are
-//!   reachable; registered retained state, state styles, slots, async and the
-//!   capability-gated host APIs (fs, storage, network) have no import yet.
-//! * Registered component arguments are not validated against their schema
-//!   before the adapter decodes them, as a script's are.
+//! * Storage and file calls run on the main thread; a script's run on a
+//!   blocking task. HTTP is asynchronous (callback-style: a core module has
+//!   no promise to settle) but GET only.
+//! * Not reachable yet: slots, virtualized lists, nested views, session
+//!   storage, processes, the clipboard, sockets, overlays and the dock.
+//! * The JavaScript engine still hosts every guest (a generated view class
+//!   per module); this is a guest *kind* next to scripts, not a second engine.
 //! * Descriptions cross as postcard; handler payloads as JSON. The grid test
 //!   below times the guest beside the script.
 
@@ -35,7 +40,7 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, anyhow};
-use gpui::{App, Entity, Window};
+use gpui::{App, Entity, WeakEntity, Window};
 use gpui_shell_wasm_abi::{self as abi, Arg, Description, Op};
 use rquickjs::{Ctx, Function, Persistent, Result as JsResult, Value, function::Func};
 use smallvec::SmallVec;
@@ -44,7 +49,7 @@ use wasmtime::{Caller, Engine, Extern, Instance, Linker, Memory, Module, Store, 
 use super::{ShellRuntime, js_error};
 use crate::{
     entities::{EntityHandle, InputEventName},
-    runtime::CallbackEntry,
+    runtime::{ApplicationGeneration, CallbackEntry},
     scope::{self, ScopePhase},
     spec::{Component, SpecId, SpecOp},
     value::Bridged,
@@ -55,30 +60,67 @@ thread_local! {
     static REGISTRY: RefCell<Registry> = RefCell::new(Registry::default());
 }
 
-/// Compiled modules by load token, and the live guest instances.
+/// Compiled modules by load token, and the live guest instances, each tagged
+/// with the application generation that loaded it.
 ///
 /// Thread-local because `ShellRuntime` is a main-thread type and the spike
-/// keeps the engine's own struct unchanged. Instances are not released when
-/// their application retires; see the spike's notes.
+/// keeps the engine's own struct unchanged. Slots are emptied rather than
+/// removed when their generation is released, so tokens and guest ids the
+/// generated view classes hold stay valid indices.
 #[derive(Default)]
 struct Registry {
     engine: Option<Engine>,
-    modules: Vec<Module>,
-    guests: Vec<Rc<Guest>>,
+    modules: Vec<Option<(Module, Option<Rc<ApplicationGeneration>>)>>,
+    guests: Vec<Option<Rc<Guest>>>,
 }
 
 /// Compiles `path` and returns the source of the JavaScript view class that
 /// stands in for it, which the ordinary module loader then evaluates.
-pub(super) fn load_module(path: &Path) -> Result<String> {
+pub(super) fn load_module(path: &Path, application: &Rc<ApplicationGeneration>) -> Result<String> {
     let bytes = std::fs::read(path).with_context(|| format!("cannot read {}", path.display()))?;
     REGISTRY.with(|registry| {
         let mut registry = registry.borrow_mut();
         let engine = registry.engine.get_or_insert_with(Engine::default).clone();
         let module = Module::new(&engine, &bytes)
             .with_context(|| format!("{} is not a WebAssembly module", path.display()))?;
-        registry.modules.push(module);
+        registry
+            .modules
+            .push(Some((module, Some(application.clone()))));
         Ok(shim(registry.modules.len() - 1))
     })
+}
+
+/// Drops the modules and guest instances `application` loaded. Called where
+/// the runtime releases the rest of an application generation's state.
+pub(super) fn release(application: &Rc<ApplicationGeneration>) {
+    let owned = |owner: &Option<Rc<ApplicationGeneration>>| {
+        owner
+            .as_ref()
+            .is_some_and(|owner| Rc::ptr_eq(owner, application))
+    };
+    // Taken out of the registry first and dropped after the borrow ends: a
+    // guest's store owns host closures that must not run under the borrow.
+    let released: Vec<_> = REGISTRY.with(|registry| {
+        let mut registry = registry.borrow_mut();
+        for slot in &mut registry.modules {
+            if slot.as_ref().is_some_and(|(_, owner)| owned(owner)) {
+                *slot = None;
+            }
+        }
+        registry
+            .guests
+            .iter_mut()
+            .filter(|slot| slot.as_ref().is_some_and(|guest| owned(&guest.application)))
+            .filter_map(Option::take)
+            .collect()
+    });
+    drop(released);
+}
+
+/// How many guest instances are live, for tests.
+#[cfg(test)]
+fn live_guests() -> usize {
+    REGISTRY.with(|registry| registry.borrow().guests.iter().flatten().count())
 }
 
 fn shim(token: usize) -> String {
@@ -115,7 +157,14 @@ pub(super) fn install(ctx: &Ctx<'_>, runtime: Weak<ShellRuntime>) -> JsResult<()
                 .upgrade()
                 .ok_or_else(|| js_error::type_error(&ctx, "the shell runtime is gone"))?;
             let guest = REGISTRY
-                .with(|registry| registry.borrow().guests.get(guest as usize).cloned())
+                .with(|registry| {
+                    registry
+                        .borrow()
+                        .guests
+                        .get(guest as usize)
+                        .cloned()
+                        .flatten()
+                })
                 .ok_or_else(|| js_error::type_error(&ctx, "unknown wasm guest"))?;
             let description = guest
                 .render()
@@ -158,7 +207,11 @@ fn record(
                             })
                     })
                     .ok_or_else(|| fail(format!("no registered component exports `{export}`")))?;
-                let arguments = component_arguments(ctx, runtime, guest, &ids, args)?;
+                let target = ArgumentTarget {
+                    api: export,
+                    descriptors: constructor.arguments(),
+                };
+                let arguments = component_arguments(ctx, runtime, guest, &ids, target, args)?;
                 let payload = constructor
                     .payload(&arguments)
                     .map_err(|error| fail(format!("{export}(...): {error}")))?;
@@ -207,11 +260,32 @@ fn record(
                     };
                     SpecOp::Callback(name, register(ctx, runtime, guest, *callback)?)
                 }
+                Op::StateStyle(name, index) => {
+                    let name = match name.as_str() {
+                        "hover" => "hover",
+                        "active" => "active",
+                        "focus" => "focus",
+                        other => return Err(fail(format!("unsupported state style `{other}`"))),
+                    };
+                    let styles = *ids.get(*index as usize).ok_or_else(|| {
+                        fail(format!("state style node {index} comes after its user"))
+                    })?;
+                    // Claimed: the declarations feed the style, never the tree.
+                    runtime
+                        .arena_mut()
+                        .claim(styles)
+                        .map_err(|error| fail(error.to_string()))?;
+                    SpecOp::StateStyle(name, styles)
+                }
                 Op::Component(name, args) => {
                     let method = runtime
                         .registered_method_descriptor(id, name)
                         .ok_or_else(|| fail(format!("the component has no method `{name}`")))?;
-                    let arguments = component_arguments(ctx, runtime, guest, &ids, args)?;
+                    let target = ArgumentTarget {
+                        api: name,
+                        descriptors: method.arguments(),
+                    };
+                    let arguments = component_arguments(ctx, runtime, guest, &ids, target, args)?;
                     let payload = method
                         .record(&arguments)
                         .map_err(|error| fail(format!("{name}(...): {error}")))?;
@@ -242,51 +316,146 @@ fn record(
         .ok_or_else(|| fail("the description has no root".to_owned()))
 }
 
-/// Converts a guest's component arguments: an element index becomes the
-/// recorded node, claimed so it is rendered by the component rather than as
-/// a child; a handler becomes an entry in the open callback generation.
+/// What the arguments of one registered constructor or method are checked
+/// against, and where they are going.
+struct ArgumentTarget<'a> {
+    api: &'a str,
+    descriptors: &'a [crate::ArgumentDescriptor],
+}
+
+/// Validates and normalizes a guest's component arguments against the
+/// descriptor's schemas, the way a script's arguments are: an omitted or
+/// bare optional becomes `Optional(..)`, an enum may arrive as a string, a
+/// number must be finite. An element index becomes the recorded node,
+/// claimed so the component renders it rather than the tree; a handler
+/// becomes an entry in the open callback generation.
 fn component_arguments(
     ctx: &Ctx<'_>,
     runtime: &Rc<ShellRuntime>,
     guest: &Rc<Guest>,
     ids: &[SpecId],
+    target: ArgumentTarget<'_>,
     args: &[abi::ComponentArg],
 ) -> JsResult<Vec<crate::ComponentArgument>> {
-    use crate::ComponentArgument as Argument;
-    let fail = |message: String| js_error::type_error(ctx, &message);
-    args.iter()
-        .map(|arg| {
-            Ok(match arg {
-                abi::ComponentArg::String(value) => Argument::String(value.clone()),
-                abi::ComponentArg::Number(value) => Argument::Number(*value),
-                abi::ComponentArg::Boolean(value) => Argument::Boolean(*value),
-                abi::ComponentArg::Enum(value) => Argument::Enum(value.clone()),
-                abi::ComponentArg::Element(index) => {
-                    let element = *ids.get(*index as usize).ok_or_else(|| {
-                        fail(format!("element argument {index} comes after its user"))
-                    })?;
-                    runtime
-                        .arena_mut()
-                        .claim(element)
-                        .map_err(|error| fail(error.to_string()))?;
-                    Argument::Element(element)
-                }
-                abi::ComponentArg::Callback(callback) => {
-                    Argument::Callback(register(ctx, runtime, guest, *callback)?)
-                }
-                abi::ComponentArg::Array(values) => {
-                    Argument::Array(component_arguments(ctx, runtime, guest, ids, values)?)
-                }
-                abi::ComponentArg::Optional(value) => Argument::Optional(match value {
-                    Some(value) => Some(Box::new(
-                        component_arguments(ctx, runtime, guest, ids, std::slice::from_ref(value))?
-                            .remove(0),
-                    )),
-                    None => None,
-                }),
-            })
+    use crate::{ArgumentSchema, ComponentArgument as Argument};
+    let ArgumentTarget { api, descriptors } = target;
+    if args.len() > descriptors.len() {
+        return Err(js_error::type_error(
+            ctx,
+            &format!("{api}(...) expects at most {} arguments", descriptors.len()),
+        ));
+    }
+    let convert = |name: &str, schema: &ArgumentSchema, arg: &abi::ComponentArg| {
+        component_argument(ctx, runtime, guest, ids, api, name, schema, arg)
+    };
+    descriptors
+        .iter()
+        .enumerate()
+        .map(|(index, descriptor)| {
+            let arg = args.get(index);
+            if let ArgumentSchema::Optional(inner) = descriptor.schema() {
+                return match arg {
+                    None | Some(abi::ComponentArg::Optional(None)) => Ok(Argument::Optional(None)),
+                    Some(abi::ComponentArg::Optional(Some(value))) => {
+                        convert(descriptor.name(), inner, value)
+                            .map(|value| Argument::Optional(Some(Box::new(value))))
+                    }
+                    Some(value) => convert(descriptor.name(), inner, value)
+                        .map(|value| Argument::Optional(Some(Box::new(value)))),
+                };
+            }
+            let arg = arg.ok_or_else(|| {
+                js_error::type_error(
+                    ctx,
+                    &format!(
+                        "{api}({}) expects {}",
+                        descriptor.name(),
+                        super::schema_name(descriptor.schema())
+                    ),
+                )
+            })?;
+            convert(descriptor.name(), descriptor.schema(), arg)
         })
         .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn component_argument(
+    ctx: &Ctx<'_>,
+    runtime: &Rc<ShellRuntime>,
+    guest: &Rc<Guest>,
+    ids: &[SpecId],
+    api: &str,
+    name: &str,
+    schema: &crate::ArgumentSchema,
+    arg: &abi::ComponentArg,
+) -> JsResult<crate::ComponentArgument> {
+    use crate::{ArgumentSchema as Schema, ComponentArgument as Argument};
+    use abi::ComponentArg as Guest_;
+    let fail = |message: String| js_error::type_error(ctx, &message);
+    let recurse = |schema: &Schema, arg: &Guest_| {
+        component_argument(ctx, runtime, guest, ids, api, name, schema, arg)
+    };
+    let converted = match (schema, arg) {
+        (Schema::String, Guest_::String(value)) => Some(Argument::String(value.clone())),
+        (Schema::Number, Guest_::Number(value)) if value.is_finite() => {
+            Some(Argument::Number(*value))
+        }
+        (Schema::Boolean, Guest_::Boolean(value)) => Some(Argument::Boolean(*value)),
+        (Schema::Enum(values), Guest_::Enum(value) | Guest_::String(value))
+            if values.contains(&value.as_str()) =>
+        {
+            Some(Argument::Enum(value.clone()))
+        }
+        (Schema::Element, Guest_::Element(index)) => {
+            let element = *ids
+                .get(*index as usize)
+                .ok_or_else(|| fail(format!("element argument {index} comes after its user")))?;
+            runtime
+                .arena_mut()
+                .claim(element)
+                .map_err(|error| fail(error.to_string()))?;
+            Some(Argument::Element(element))
+        }
+        (Schema::Callback(_), Guest_::Callback(callback)) => Some(Argument::Callback(register(
+            ctx, runtime, guest, *callback,
+        )?)),
+        (Schema::Array(item), Guest_::Array(values)) => Some(Argument::Array(
+            values
+                .iter()
+                .map(|value| recurse(item, value))
+                .collect::<JsResult<_>>()?,
+        )),
+        (Schema::Optional(_), Guest_::Optional(None)) => Some(Argument::Optional(None)),
+        (Schema::Optional(inner), Guest_::Optional(Some(value))) => {
+            Some(Argument::Optional(Some(Box::new(recurse(inner, value)?))))
+        }
+        (Schema::Optional(inner), value) => {
+            Some(Argument::Optional(Some(Box::new(recurse(inner, value)?))))
+        }
+        // A registered retained state, checked against the kind the schema
+        // names, as a script's state object is.
+        (Schema::Entity(kind), Guest_::State(handle))
+            if runtime
+                .component_states
+                .try_borrow()
+                .map_err(|_| fail("retained component state is already borrowed".into()))?
+                .kind(*handle)
+                == Some(*kind) =>
+        {
+            Some(Argument::Entity {
+                kind,
+                handle: *handle,
+            })
+        }
+        _ => None,
+    };
+    converted.ok_or_else(|| {
+        fail(format!(
+            "{api}({name}) expects {}",
+            super::schema_name(schema)
+        ))
+    })
 }
 
 /// The style methods whose string argument is a color.
@@ -402,14 +571,18 @@ struct Guest {
     render: TypedFunc<(), u64>,
     dispatch: TypedFunc<(u32, u32, u32), u32>,
     alloc: TypedFunc<u32, u32>,
+    /// The application generation the guest belongs to; [`release`] drops it
+    /// with that generation.
+    application: Option<Rc<ApplicationGeneration>>,
 }
 
 struct HostState {
     runtime: Weak<ShellRuntime>,
     guest: Weak<Guest>,
     /// The view the guest was instantiated for, so a handler that runs from
-    /// a native subscription (no script scope of its own) can open one.
-    view: Option<Entity<ScriptView>>,
+    /// a native subscription (no script scope of its own) can open one. Weak:
+    /// the view owns the guest's lifetime, not the other way round.
+    view: Option<WeakEntity<ScriptView>>,
 }
 
 impl Guest {
@@ -426,8 +599,8 @@ impl Guest {
                 registry
                     .modules
                     .get(token)
-                    .cloned()
-                    .ok_or_else(|| anyhow!("unknown wasm module {token}"))?,
+                    .and_then(|slot| slot.as_ref().map(|(module, _)| module.clone()))
+                    .ok_or_else(|| anyhow!("wasm module {token} is unknown or released"))?,
             ))
         })?;
 
@@ -439,7 +612,7 @@ impl Guest {
             HostState {
                 runtime: Rc::downgrade(runtime),
                 guest: Weak::new(),
-                view: scope::current_view(),
+                view: scope::current_view().map(|view| view.downgrade()),
             },
         );
         let instance: Instance = linker.instantiate(&mut store, &module)?;
@@ -457,6 +630,7 @@ impl Guest {
             render,
             dispatch,
             alloc,
+            application: scope::current_application_generation(),
         });
         guest.store.borrow_mut().data_mut().guest = Rc::downgrade(&guest);
 
@@ -467,7 +641,7 @@ impl Guest {
 
         let id = REGISTRY.with(|registry| {
             let mut registry = registry.borrow_mut();
-            registry.guests.push(guest);
+            registry.guests.push(Some(guest));
             registry.guests.len() - 1
         });
         Ok(id as u32)
@@ -499,13 +673,30 @@ impl Guest {
     /// A handler that fires from a native subscription rather than from a
     /// script dispatch: open the event scope a script handler would have had.
     fn dispatch_native(self: &Rc<Self>, callback: u32, window: &mut Window, app: &mut App) {
-        let view = self.store.borrow().data().view.clone();
+        self.dispatch_native_with(callback, b"null", window, app);
+    }
+
+    /// [`Self::dispatch_native`] with a JSON payload for the handler.
+    fn dispatch_native_with(
+        self: &Rc<Self>,
+        callback: u32,
+        payload: &[u8],
+        window: &mut Window,
+        app: &mut App,
+    ) {
+        let view = self
+            .store
+            .borrow()
+            .data()
+            .view
+            .as_ref()
+            .and_then(WeakEntity::upgrade);
         let Some(runtime) = self.store.borrow().data().runtime.upgrade() else {
             return;
         };
         let (_guard, _generation) =
             scope::enter_runtime(&runtime, window, app, ScopePhase::Event, view);
-        match self.dispatch(callback, b"null") {
+        match self.dispatch(callback, payload) {
             Ok(true) => refresh_current_view(),
             Ok(false) => {}
             Err(error) => tracing::error!("wasm guest handler failed: {error:#}"),
@@ -534,17 +725,177 @@ fn read_string(caller: &mut Caller<'_, HostState>, ptr: u32, len: u32) -> Result
     Ok(String::from_utf8(bytes)?)
 }
 
+fn read_bytes(caller: &mut Caller<'_, HostState>, ptr: u32, len: u32) -> Result<Vec<u8>> {
+    let memory = guest_memory(caller)?;
+    let mut bytes = vec![0; len as usize];
+    memory.read(&*caller, ptr as usize, &mut bytes)?;
+    Ok(bytes)
+}
+
 /// Copies `text` into a buffer the guest allocated and returns it packed.
 fn write_string(caller: &mut Caller<'_, HostState>, text: &str) -> Result<u64> {
+    write_bytes(caller, text.as_bytes())
+}
+
+fn write_bytes(caller: &mut Caller<'_, HostState>, bytes: &[u8]) -> Result<u64> {
     let alloc = caller
         .get_export(abi::export::ALLOC)
         .and_then(Extern::into_func)
         .ok_or_else(|| anyhow!("the guest exports no allocator"))?
         .typed::<u32, u32>(&*caller)?;
-    let len = text.len() as u32;
+    let len = bytes.len() as u32;
     let ptr = alloc.call(&mut *caller, len)?;
-    guest_memory(caller)?.write(&mut *caller, ptr as usize, text.as_bytes())?;
+    guest_memory(caller)?.write(&mut *caller, ptr as usize, bytes)?;
     Ok(abi::pack(ptr, len))
+}
+
+fn data_from_guest(data: abi::Data) -> crate::ComponentDataValue {
+    use crate::ComponentDataValue as Value;
+    match data {
+        abi::Data::Null => Value::Null,
+        abi::Data::Boolean(value) => Value::Boolean(value),
+        abi::Data::Number(value) => Value::Number(value),
+        abi::Data::String(value) => Value::String(value),
+        abi::Data::Array(values) => Value::Array(values.into_iter().map(data_from_guest).collect()),
+        abi::Data::Object(fields) => Value::Object(
+            fields
+                .into_iter()
+                .map(|(key, value)| (key, data_from_guest(value)))
+                .collect(),
+        ),
+    }
+}
+
+fn data_to_guest(data: crate::ComponentDataValue) -> abi::Data {
+    use crate::ComponentDataValue as Value;
+    match data {
+        Value::Null => abi::Data::Null,
+        Value::Boolean(value) => abi::Data::Boolean(value),
+        Value::Number(value) => abi::Data::Number(value),
+        Value::String(value) => abi::Data::String(value),
+        Value::Array(values) => abi::Data::Array(values.into_iter().map(data_to_guest).collect()),
+        Value::Object(fields) => abi::Data::Object(
+            fields
+                .into_iter()
+                .map(|(key, value)| (key, data_to_guest(value)))
+                .collect(),
+        ),
+    }
+}
+
+/// A state constructor's arguments, checked against its schemas. Plain
+/// values only: nothing a state is built from needs a render's elements or
+/// handlers, and outside a render there is no callback generation open.
+fn state_arguments(
+    api: &str,
+    descriptors: &[crate::ArgumentDescriptor],
+    args: &[abi::ComponentArg],
+) -> Result<Vec<crate::ComponentArgument>> {
+    use crate::{ArgumentSchema as Schema, ComponentArgument as Argument};
+    fn plain(schema: &Schema, arg: &abi::ComponentArg) -> Option<Argument> {
+        use abi::ComponentArg as Guest_;
+        Some(match (schema, arg) {
+            (Schema::String, Guest_::String(value)) => Argument::String(value.clone()),
+            (Schema::Number, Guest_::Number(value)) if value.is_finite() => {
+                Argument::Number(*value)
+            }
+            (Schema::Boolean, Guest_::Boolean(value)) => Argument::Boolean(*value),
+            (Schema::Enum(values), Guest_::Enum(value) | Guest_::String(value))
+                if values.contains(&value.as_str()) =>
+            {
+                Argument::Enum(value.clone())
+            }
+            (Schema::Array(item), Guest_::Array(values)) => Argument::Array(
+                values
+                    .iter()
+                    .map(|value| plain(item, value))
+                    .collect::<Option<_>>()?,
+            ),
+            (Schema::Optional(_), Guest_::Optional(None)) => Argument::Optional(None),
+            (Schema::Optional(inner), Guest_::Optional(Some(value))) => {
+                Argument::Optional(Some(Box::new(plain(inner, value)?)))
+            }
+            (Schema::Optional(inner), value) => {
+                Argument::Optional(Some(Box::new(plain(inner, value)?)))
+            }
+            _ => return None,
+        })
+    }
+    anyhow::ensure!(
+        args.len() <= descriptors.len(),
+        "{api}(...) expects at most {} arguments",
+        descriptors.len()
+    );
+    descriptors
+        .iter()
+        .enumerate()
+        .map(|(index, descriptor)| {
+            let converted = match (descriptor.schema(), args.get(index)) {
+                (Schema::Optional(_), None) => Some(Argument::Optional(None)),
+                (_, None) => None,
+                (schema, Some(arg)) => plain(schema, arg),
+            };
+            converted.ok_or_else(|| {
+                anyhow!(
+                    "{api}({}) expects {}",
+                    descriptor.name(),
+                    super::schema_name(descriptor.schema())
+                )
+            })
+        })
+        .collect()
+}
+
+/// Runs `body` against the current application's persistent store, under the
+/// same capability a script's `localStorage` is.
+fn with_local_storage<R>(body: impl FnOnce(&mut crate::storage::Storage) -> R) -> Result<R> {
+    let policy = scope::policy();
+    anyhow::ensure!(
+        policy.capabilities().has_storage(),
+        "{}",
+        crate::capability::CapabilityError::StorageDenied
+    );
+    policy.with_local_storage(body).ok_or_else(|| {
+        anyhow!(
+            "storage has no backing file; the host must call set_storage_path \
+             before the application runs"
+        )
+    })
+}
+
+/// Writes the store's pending revision before returning.
+///
+/// A script's writes are persisted off the main thread by the scheduler,
+/// which a module import cannot reach; the spike writes synchronously
+/// instead, through the store's own write queue so the two never interleave.
+fn persist_local_storage() -> Result<()> {
+    let policy = scope::policy();
+    while let Some(Some(pending)) = policy.with_local_storage(crate::storage::Storage::begin_write)
+    {
+        let revision = pending.revision();
+        let (path, body) = pending.into_parts();
+        let result = crate::storage::persist(&path, body);
+        let failed = result.clone().err();
+        let woken = policy
+            .with_local_storage(|store| store.finish_write(revision, result))
+            .unwrap_or_default();
+        for wake in woken {
+            wake();
+        }
+        if let Some(error) = failed {
+            anyhow::bail!("storage write failed: {error}");
+        }
+    }
+    Ok(())
+}
+
+fn state_descriptor(runtime: &ShellRuntime, export: &str) -> Result<crate::StateDescriptor> {
+    runtime
+        .components
+        .states()
+        .find(|descriptor| descriptor.export() == export)
+        .cloned()
+        .ok_or_else(|| anyhow!("no registered state exports `{export}`"))
 }
 
 fn runtime_of(caller: &Caller<'_, HostState>) -> Result<Rc<ShellRuntime>> {
@@ -640,6 +991,284 @@ fn link_imports(linker: &mut Linker<HostState>) -> Result<()> {
             Ok(())
         },
     )?;
+    // Network: `fetch`'s authorization on this thread (a denial traps the
+    // call), the request on the background executor, and the guest's handler
+    // back on the main thread with the result — a callback, because a core
+    // module has no promise to settle.
+    linker.func_wrap(
+        module,
+        abi::import::HTTP_GET,
+        |mut caller: Caller<'_, HostState>,
+         url_ptr: u32,
+         url_len: u32,
+         callback: u32|
+         -> Result<()> {
+            let url = read_string(&mut caller, url_ptr, url_len)?;
+            let capabilities = scope::policy().capabilities().clone();
+            let url = super::standard::fetch::authorized_get(&capabilities, &url)
+                .map_err(|error| anyhow!(error))?;
+            let guest = caller.data().guest.clone();
+            scope::with_current(|window, cx| {
+                window
+                    .spawn(cx, async move |cx| {
+                        let result = cx
+                            .background_executor()
+                            .spawn(async move { super::standard::fetch::get(capabilities, url) })
+                            .await;
+                        let payload = match result {
+                            Ok((status, body)) => serde_json::json!({
+                                "status": status,
+                                "body": String::from_utf8_lossy(&body),
+                            }),
+                            Err(error) => serde_json::json!({ "error": error }),
+                        }
+                        .to_string();
+                        // A guest released while the request was in flight
+                        // (its application retired) is simply not called.
+                        let _ = cx.update(|window, app| {
+                            if let Some(guest) = guest.upgrade() {
+                                guest.dispatch_native_with(
+                                    callback,
+                                    payload.as_bytes(),
+                                    window,
+                                    app,
+                                );
+                            }
+                        });
+                    })
+                    .detach();
+            })
+            .ok_or_else(|| anyhow!("http_get needs a live host call"))
+        },
+    )?;
+    // Files: the same resolver a script's `fs` goes through, which opens the
+    // granted directory once and works on that handle. A script's call runs
+    // on a blocking task; the spike's runs inline.
+    linker.func_wrap(
+        module,
+        abi::import::FS_READ_TEXT,
+        |mut caller: Caller<'_, HostState>, path_ptr: u32, path_len: u32| -> Result<u64> {
+            use std::io::Read as _;
+            const MAX_READ_BYTES: u64 = 64 * 1024 * 1024;
+            let path = read_string(&mut caller, path_ptr, path_len)?;
+            let grant = scope::policy()
+                .capabilities()
+                .open(Path::new(&path), crate::capability::Access::Read)
+                .map_err(|error| anyhow!("{error}"))?;
+            let (dir, relative) = grant.into_parts();
+            let mut text = String::new();
+            dir.open(&relative)?
+                .take(MAX_READ_BYTES + 1)
+                .read_to_string(&mut text)?;
+            anyhow::ensure!(
+                text.len() as u64 <= MAX_READ_BYTES,
+                "`{path}` is larger than {MAX_READ_BYTES} bytes"
+            );
+            write_string(&mut caller, &text)
+        },
+    )?;
+    linker.func_wrap(
+        module,
+        abi::import::FS_WRITE_TEXT,
+        |mut caller: Caller<'_, HostState>,
+         path_ptr: u32,
+         path_len: u32,
+         text_ptr: u32,
+         text_len: u32|
+         -> Result<()> {
+            let path = read_string(&mut caller, path_ptr, path_len)?;
+            let text = read_bytes(&mut caller, text_ptr, text_len)?;
+            let grant = scope::policy()
+                .capabilities()
+                .open(Path::new(&path), crate::capability::Access::Write)
+                .map_err(|error| anyhow!("{error}"))?;
+            let (dir, relative) = grant.into_parts();
+            dir.write(&relative, text)?;
+            Ok(())
+        },
+    )?;
+    linker.func_wrap(
+        module,
+        abi::import::STORAGE_GET,
+        |mut caller: Caller<'_, HostState>, key_ptr: u32, key_len: u32| -> Result<u64> {
+            let key = read_string(&mut caller, key_ptr, key_len)?;
+            let value = with_local_storage(|store| {
+                store.values().map(|values| {
+                    values.get(&key).map(|value| match value {
+                        serde_json::Value::String(text) => text.clone(),
+                        other => other.to_string(),
+                    })
+                })
+            })?
+            .map_err(|error| anyhow!(error))?;
+            match value {
+                Some(value) => write_string(&mut caller, &value),
+                None => Ok(abi::ABSENT),
+            }
+        },
+    )?;
+    linker.func_wrap(
+        module,
+        abi::import::STORAGE_SET,
+        |mut caller: Caller<'_, HostState>,
+         key_ptr: u32,
+         key_len: u32,
+         value_ptr: u32,
+         value_len: u32|
+         -> Result<()> {
+            let key = read_string(&mut caller, key_ptr, key_len)?;
+            let value = read_string(&mut caller, value_ptr, value_len)?;
+            with_local_storage(|store| store.set(key, serde_json::Value::String(value)))?
+                .map_err(|error| anyhow!(error))?;
+            persist_local_storage()
+        },
+    )?;
+    linker.func_wrap(
+        module,
+        abi::import::STORAGE_REMOVE,
+        |mut caller: Caller<'_, HostState>, key_ptr: u32, key_len: u32| -> Result<()> {
+            let key = read_string(&mut caller, key_ptr, key_len)?;
+            with_local_storage(|store| {
+                store.values().map(|values| {
+                    values.remove(&key);
+                })?;
+                store.touch();
+                Ok::<_, String>(())
+            })?
+            .map_err(|error| anyhow!(error))?;
+            persist_local_storage()
+        },
+    )?;
+    linker.func_wrap(
+        module,
+        abi::import::STATE_NEW,
+        |mut caller: Caller<'_, HostState>,
+         export_ptr: u32,
+         export_len: u32,
+         args_ptr: u32,
+         args_len: u32|
+         -> Result<u64> {
+            let export = read_string(&mut caller, export_ptr, export_len)?;
+            let args: Vec<abi::ComponentArg> =
+                postcard::from_bytes(&read_bytes(&mut caller, args_ptr, args_len)?)?;
+            let runtime = runtime_of(&caller)?;
+            anyhow::ensure!(
+                !matches!(
+                    scope::current_phase(),
+                    Some(ScopePhase::Render | ScopePhase::Layout)
+                ),
+                "{export}.new(...) cannot run during render; create state in init or a handler"
+            );
+            let descriptor = state_descriptor(&runtime, &export)?;
+            let arguments = state_arguments(&export, descriptor.arguments(), &args)?;
+            runtime.flush_component_state_releases();
+            let state = scope::with_current(|window, cx| descriptor.create(&arguments, window, cx))
+                .ok_or_else(|| anyhow!("{export}.new(...) needs a live host call"))?
+                .map_err(|error| anyhow!("{export}.new(...): {error}"))?;
+            runtime
+                .component_states
+                .try_borrow_mut()
+                .map_err(|_| anyhow!("retained component state is already borrowed"))?
+                .insert(
+                    descriptor.kind(),
+                    scope::current_application_generation(),
+                    state,
+                )
+                .map_err(|error| anyhow!(error))
+        },
+    )?;
+    linker.func_wrap(
+        module,
+        abi::import::STATE_CALL,
+        |mut caller: Caller<'_, HostState>,
+         handle: u64,
+         export_ptr: u32,
+         export_len: u32,
+         method_ptr: u32,
+         method_len: u32,
+         args_ptr: u32,
+         args_len: u32|
+         -> Result<u64> {
+            let export = read_string(&mut caller, export_ptr, export_len)?;
+            let name = read_string(&mut caller, method_ptr, method_len)?;
+            let args: Vec<abi::Data> =
+                postcard::from_bytes(&read_bytes(&mut caller, args_ptr, args_len)?)?;
+            let runtime = runtime_of(&caller)?;
+            let descriptor = state_descriptor(&runtime, &export)?;
+            let method = descriptor
+                .methods()
+                .iter()
+                .find(|method| method.name() == name)
+                .cloned()
+                .ok_or_else(|| anyhow!("`{export}` has no method `{name}`"))?;
+            anyhow::ensure!(
+                method.is_readonly()
+                    || !matches!(
+                        scope::current_phase(),
+                        Some(ScopePhase::Render | ScopePhase::Layout)
+                    ),
+                "{export}.{name}(...) changes state and cannot run during render"
+            );
+            runtime.flush_component_state_releases();
+            // Prepared under the store's borrow and run after it, so the call
+            // can reach GPUI without the state table held.
+            let call = {
+                let store = runtime
+                    .component_states
+                    .try_borrow()
+                    .map_err(|_| anyhow!("retained component state is already borrowed"))?;
+                method.prepare(
+                    &store,
+                    handle,
+                    descriptor.kind(),
+                    args.into_iter().map(data_from_guest).collect(),
+                )?
+            };
+            let result = scope::with_current(move |window, cx| call(window, cx))
+                .ok_or_else(|| anyhow!("{export}.{name}(...) needs a live host call"))??;
+            write_bytes(&mut caller, &postcard::to_allocvec(&data_to_guest(result))?)
+        },
+    )?;
+    linker.func_wrap(
+        module,
+        abi::import::STATE_ON,
+        |mut caller: Caller<'_, HostState>,
+         handle: u64,
+         export_ptr: u32,
+         export_len: u32,
+         event_ptr: u32,
+         event_len: u32,
+         callback: u32|
+         -> Result<()> {
+            let export = read_string(&mut caller, export_ptr, export_len)?;
+            let event = read_string(&mut caller, event_ptr, event_len)?;
+            let event = InputEventName::from_name(&event).ok_or_else(|| {
+                anyhow!("`{event}` is not an input event; expected change, submit, focus or blur")
+            })?;
+            let runtime = runtime_of(&caller)?;
+            let descriptor = state_descriptor(&runtime, &export)?;
+            let guest = caller.data().guest.clone();
+            let handler: crate::component_registry::InputEventHandler =
+                Box::new(move |_event, window, app| {
+                    if let Some(guest) = guest.upgrade() {
+                        guest.dispatch_native(callback, window, app);
+                    }
+                });
+            let subscription = scope::with_current(|window, cx| {
+                runtime
+                    .component_states
+                    .try_borrow()
+                    .map_err(|_| anyhow!("retained component state is already borrowed"))?
+                    .subscribe(handle, &descriptor, event, handler, window, cx)
+            })
+            .ok_or_else(|| anyhow!("{export}.on(...) needs a live host call"))??;
+            runtime
+                .component_states
+                .try_borrow_mut()
+                .map_err(|_| anyhow!("retained component state is already borrowed"))?
+                .attach(handle, subscription)
+        },
+    )?;
     Ok(())
 }
 
@@ -679,10 +1308,11 @@ mod tests {
             .join(format!("{example}.wasm"))
     }
 
-    /// An application directory holding the guest and a manifest naming it.
-    fn application() -> PathBuf {
+    /// An application directory holding example `example`'s guest and a
+    /// manifest naming it as the entry.
+    fn application(example: &str) -> PathBuf {
         let directory = std::env::temp_dir().join(format!(
-            "gpui-shell-wasm-guest-{}-{}",
+            "gpui-shell-{example}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -690,10 +1320,12 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&directory).unwrap();
-        std::fs::copy(build_guest("wasm_todolist"), directory.join("todo.wasm")).unwrap();
+        std::fs::copy(build_guest(example), directory.join("guest.wasm")).unwrap();
         std::fs::write(
             directory.join(MANIFEST_FILE),
-            r#"{"id": "dev.test.wasm-todolist", "name": "Wasm Todo", "entry": "todo.wasm"}"#,
+            format!(
+                r#"{{"id": "dev.test.{example}", "name": "{example}", "entry": "guest.wasm"}}"#
+            ),
         )
         .unwrap();
         directory
@@ -719,7 +1351,11 @@ mod tests {
 
     impl Harness {
         fn load(cx: &mut TestAppContext) -> Self {
-            let directory = application();
+            Self::load_example(cx, "wasm_todolist")
+        }
+
+        fn load_example(cx: &mut TestAppContext, example: &str) -> Self {
+            let directory = application(example);
             // The runtime the shipped command builds: with the catalog.
             let components = crate::components::components().expect("catalog");
             cx.update(|cx| crate::init_with_components(cx, &components));
@@ -867,6 +1503,8 @@ mod tests {
         app.click_registered("Button");
         let tree = app.tree();
         assert!(tree.contains("Write the spike"), "{tree}");
+        // The row's hover style, collected on a detached node.
+        assert!(tree.contains(":hover(.bg[Str(\"#"), "{tree}");
         assert!(tree.contains("1 of 1 remaining"), "{tree}");
         let input = app.input();
         let cleared = app
@@ -909,6 +1547,312 @@ mod tests {
         let tree = app.tree();
         assert!(!tree.contains("Write the spike"), "{tree}");
         assert!(tree.contains("1 of 1 remaining"), "{tree}");
+
+        // Retiring the application releases its guest with the rest of its
+        // state, as a reload does to the generation it replaces.
+        let live = live_guests();
+        assert!(live >= 1);
+        let view = app.view.clone();
+        let runtime = app.runtime.clone();
+        app.context.update(|_, cx| {
+            let application = view
+                .read(cx)
+                .application_generation()
+                .expect("a loaded application has a generation");
+            runtime.release_application_generation(&application, cx);
+        });
+        assert_eq!(live_guests(), live - 1);
+    }
+
+    #[gpui::test]
+    fn a_guest_keeps_registered_state_and_calls_its_methods(cx: &mut TestAppContext) {
+        let mut app = Harness::load_example(cx, "wasm_state");
+        let tree = app.tree();
+        assert!(tree.contains("Input"), "{tree}");
+        assert!(tree.contains("Echo: "), "{tree}");
+
+        // The catalog's own InputState, created by the guest's `state_new`.
+        let runtime = app.runtime.clone();
+        let input = {
+            let store = runtime.component_states.borrow();
+            // Handles are numbered from zero.
+            let handle = (0..64)
+                .find(|handle| store.kind(*handle) == Some("InputState"))
+                .expect("the guest created an InputState");
+            store
+                .with::<Entity<gpui_component::input::InputState>, _>(
+                    handle,
+                    "InputState",
+                    Clone::clone,
+                )
+                .expect("a gpui-component InputState")
+        };
+
+        // Echo reads the state through its `value()` method.
+        app.context.update(|window, cx| {
+            input.update(cx, |state, cx| state.set_value("hello", window, cx))
+        });
+        app.click_registered("Button");
+        let tree = app.tree();
+        assert!(tree.contains("Echo: hello"), "{tree}");
+
+        // Enter reaches the guest through the state's `submit` event; the
+        // handler reads the value and clears it with `set_value`.
+        app.context.update(|_, cx| {
+            input.update(cx, |_, cx| {
+                cx.emit(InputEvent::PressEnter {
+                    secondary: false,
+                    shift: false,
+                })
+            })
+        });
+        app.settle();
+        let tree = app.tree();
+        assert!(tree.contains("Submitted: hello"), "{tree}");
+        let cleared = app
+            .context
+            .update(|_, cx| input.read(cx).value().to_string());
+        assert_eq!(cleared, "");
+    }
+
+    /// The storage guest, loaded into a runtime without the catalog (it draws
+    /// only base elements), under the host's default policy.
+    fn start_storage_guest(cx: &mut TestAppContext) -> Result<String> {
+        let directory = application("wasm_storage");
+        let runtime = ShellRuntime::new_isolated().expect("runtime");
+        cx.update(|cx| runtime.set_global(cx));
+        let window = cx.add_window(|_, _| gpui::Empty);
+        let mut context = VisualTestContext::from_window(*window.deref(), cx);
+        let view_type = runtime.load_app(&directory, "guest.wasm")?;
+        let object = context.update(|window, cx| runtime.instantiate(&view_type, window, cx))?;
+        let snapshot = context.update(|window, cx| {
+            runtime.build_snapshot(&object, None, crate::policy::default(), window, cx)
+        })?;
+        Ok(snapshot.debug_tree())
+    }
+
+    #[gpui::test]
+    fn a_guest_persists_through_the_storage_capability(cx: &mut TestAppContext) {
+        let file = std::env::temp_dir().join(format!(
+            "gpui-shell-wasm-storage-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        cx.update(|cx| crate::init(cx));
+        crate::set_capabilities(crate::Capabilities::new().storage(true));
+        crate::set_storage_path(file.clone());
+
+        let first = start_storage_guest(cx).expect("first start");
+        assert!(first.contains("Visits: 1"), "{first}");
+        let second = start_storage_guest(cx).expect("second start");
+        assert!(second.contains("Visits: 2"), "{second}");
+        let stored = std::fs::read_to_string(&file).expect("the store reached the disk");
+        assert!(stored.contains("\"visits\""), "{stored}");
+    }
+
+    #[gpui::test]
+    fn a_guest_reads_and_writes_files_inside_its_fs_grants(cx: &mut TestAppContext) {
+        let directory = std::env::temp_dir().join(format!(
+            "gpui-shell-wasm-fs-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let directory = directory.canonicalize().unwrap();
+        let notes = directory.join("notes.txt");
+        std::fs::write(&notes, "remember the milk").unwrap();
+        let store = directory.join("store.json");
+        std::fs::write(
+            &store,
+            serde_json::json!({ "notes_path": notes.to_string_lossy() }).to_string(),
+        )
+        .unwrap();
+
+        cx.update(|cx| crate::init(cx));
+        crate::set_storage_path(store);
+        crate::set_capabilities(
+            crate::Capabilities::new()
+                .storage(true)
+                .read_roots([directory.clone()])
+                .write_roots([directory.clone()]),
+        );
+        let tree = start_storage_guest(cx).expect("start");
+        assert!(tree.contains("Notes: remember the milk"), "{tree}");
+        let copy = std::fs::read_to_string(directory.join("notes.txt.copy")).unwrap();
+        assert_eq!(copy, "REMEMBER THE MILK");
+
+        // Without a read grant the same call traps with the capability's
+        // message.
+        crate::set_capabilities(crate::Capabilities::new().storage(true));
+        let error = start_storage_guest(cx).expect_err("no fs grant");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("filesystem read is not granted; declare capabilities.fs.read"),
+            "{message}"
+        );
+    }
+
+    /// A loopback server that answers one request with `body`.
+    fn serve_once(body: &'static str) -> u16 {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut buffer).unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+            }
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        port
+    }
+
+    /// The fetch guest mounted as a view, with its store naming `url`.
+    fn start_fetch_guest(
+        cx: &mut TestAppContext,
+        url: &str,
+        capabilities: crate::Capabilities,
+    ) -> Result<(VisualTestContext, Entity<ScriptView>)> {
+        let directory = application("wasm_fetch");
+        let store = directory.join("store.json");
+        std::fs::write(&store, serde_json::json!({ "url": url }).to_string()).unwrap();
+        cx.update(|cx| crate::init(cx));
+        crate::set_storage_path(store);
+        crate::set_capabilities(capabilities.storage(true));
+        let runtime = ShellRuntime::new_isolated().expect("runtime");
+        cx.update(|cx| runtime.set_global(cx));
+        let window = cx.add_window(|_, _| gpui::Empty);
+        let mut context = VisualTestContext::from_window(*window.deref(), cx);
+        let view_type = runtime.load_app(&directory, "guest.wasm")?;
+        let view = context.update(|window, cx| runtime.instantiate_view(&view_type, window, cx))?;
+        Ok((context, view))
+    }
+
+    fn drawn_tree(context: &mut VisualTestContext, view: &Entity<ScriptView>) -> String {
+        let element = view.clone();
+        context.draw(
+            gpui::Point::default(),
+            gpui::size(gpui::px(400.), gpui::px(300.)),
+            move |_, _| element.into_any_element(),
+        );
+        let view = view.clone();
+        context.update(|_, cx| {
+            view.read(cx)
+                .snapshot()
+                .map(RenderSnapshot::debug_tree)
+                .unwrap_or_default()
+        })
+    }
+
+    #[gpui::test]
+    fn a_guest_fetches_without_blocking_and_hears_back(cx: &mut TestAppContext) {
+        let port = serve_once("hello from the network");
+        let (mut context, view) = start_fetch_guest(
+            cx,
+            &format!("http://127.0.0.1:{port}/greeting"),
+            crate::Capabilities::new().network_hosts(["127.0.0.1".to_owned()]),
+        )
+        .expect("start");
+
+        // `init` returned before the response: the first frame is pending.
+        let first = drawn_tree(&mut context, &view);
+        assert!(first.contains("Status: pending"), "{first}");
+
+        // The response arrives off the main thread; the handler runs back on
+        // it and asks for a render.
+        let mut tree = String::new();
+        for _ in 0..200 {
+            context.run_until_parked();
+            tree = drawn_tree(&mut context, &view);
+            if tree.contains("Status: 200") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(tree.contains("Status: 200"), "{tree}");
+        assert!(tree.contains("Body: hello from the network"), "{tree}");
+    }
+
+    #[gpui::test]
+    fn a_request_outside_the_network_grants_is_refused(cx: &mut TestAppContext) {
+        let error = start_fetch_guest(
+            cx,
+            "http://127.0.0.1:9/greeting",
+            crate::Capabilities::new(),
+        )
+        .err()
+        .expect("no network grant");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("HTTP request GET http://127.0.0.1:9/greeting is not granted"),
+            "{message}"
+        );
+    }
+
+    #[gpui::test]
+    fn storage_without_the_capability_is_refused(cx: &mut TestAppContext) {
+        cx.update(|cx| crate::init(cx));
+        crate::set_capabilities(crate::Capabilities::new());
+        let error = start_storage_guest(cx).expect_err("no storage grant");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(&crate::capability::CapabilityError::StorageDenied.to_string()),
+            "{message}"
+        );
+    }
+
+    #[gpui::test]
+    fn a_mistyped_component_argument_is_refused_with_the_schema(cx: &mut TestAppContext) {
+        let directory = std::env::temp_dir().join(format!(
+            "gpui-shell-wasm-bad-args-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::copy(build_guest("wasm_bad_args"), directory.join("bad.wasm")).unwrap();
+
+        let components = crate::components::components().expect("catalog");
+        cx.update(|cx| crate::init_with_components(cx, &components));
+        let runtime = cx
+            .update(|cx| ShellRuntime::new_with_components(cx, components))
+            .expect("runtime");
+        let window = cx.add_window(|_, _| gpui::Empty);
+        let mut context = VisualTestContext::from_window(*window.deref(), cx);
+        let view_type = runtime.load_app(&directory, "bad.wasm").expect("load");
+        let object = context
+            .update(|window, cx| runtime.instantiate(&view_type, window, cx))
+            .expect("instantiate");
+        let error = context
+            .update(|window, cx| {
+                runtime.build_snapshot(&object, None, crate::policy::default(), window, cx)
+            })
+            .err()
+            .expect("a mistyped argument fails the render");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("Progress(id) expects a string"),
+            "{message}"
+        );
     }
 
     /// `tests/benchmark.rs`'s grid, verbatim at 40 x 5.
@@ -1020,7 +1964,16 @@ export default class Grid extends View {
         let guest_build = time(&mut context, &guest);
 
         // The guest's own share: running the module and decoding its JSON.
-        let instance = REGISTRY.with(|registry| registry.borrow().guests.last().cloned().unwrap());
+        let instance = REGISTRY.with(|registry| {
+            registry
+                .borrow()
+                .guests
+                .iter()
+                .flatten()
+                .last()
+                .cloned()
+                .unwrap()
+        });
         let mut bytes = 0;
         let guest_only = best_per_call(|| {
             let description = instance.render().expect("render");
@@ -1043,8 +1996,21 @@ export default class Grid extends View {
             );
             elapsed
         };
-        let guest_materialize = materialize(&mut context, &guest_snapshot);
-        let script_materialize = materialize(&mut context, &script_snapshot);
+        // Both orders: whichever is timed first has been seen to come out
+        // slower, so each side's figure is its better reading of the two.
+        let guest_first = materialize(&mut context, &guest_snapshot);
+        let script_second = materialize(&mut context, &script_snapshot);
+        let script_first = materialize(&mut context, &script_snapshot);
+        let guest_second = materialize(&mut context, &guest_snapshot);
+        println!(
+            "\n[B order] guest then script: {:.3} / {:.3} ms; script then guest: {:.3} / {:.3} ms",
+            guest_first.as_secs_f64() * 1000.0,
+            script_second.as_secs_f64() * 1000.0,
+            script_first.as_secs_f64() * 1000.0,
+            guest_second.as_secs_f64() * 1000.0,
+        );
+        let guest_materialize = guest_first.min(guest_second);
+        let script_materialize = script_first.min(script_second);
 
         let ms = |duration: std::time::Duration| duration.as_secs_f64() * 1000.0;
         println!(

@@ -2115,6 +2115,8 @@ impl ShellRuntime {
         release.retire(cx);
         cancel_application_tasks(application);
         self.retire_templates(application);
+        #[cfg(feature = "wasm-guest")]
+        wasm_guest::release(application);
     }
 
     /// The `Drop`-path counterpart of [`Self::release_application_generation`].
@@ -2132,6 +2134,8 @@ impl ShellRuntime {
         release.retire_without_context();
         cancel_application_tasks(application);
         self.retire_templates(application);
+        #[cfg(feature = "wasm-guest")]
+        wasm_guest::release(application);
     }
 
     fn rollback_retained_since(
@@ -2229,7 +2233,7 @@ impl ShellRuntime {
             .extension()
             .is_some_and(|extension| extension == "wasm")
         {
-            wasm_guest::load_module(&entry)?
+            wasm_guest::load_module(&entry, &application)?
         } else {
             read_module_source(&entry)?
         };

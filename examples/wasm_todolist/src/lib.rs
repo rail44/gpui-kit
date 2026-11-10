@@ -78,6 +78,7 @@ impl TodoList {
             .gap(8.)
             .px(12.)
             .py(6.)
+            .hover(|style| style.bg("muted"))
             .child(
                 checkbox(format!("done-{id}"))
                     .checked(item.done)

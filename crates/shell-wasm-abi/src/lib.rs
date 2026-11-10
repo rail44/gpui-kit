@@ -50,6 +50,57 @@ pub mod import {
     pub const INPUT_ON_SUBMIT: &str = "input_on_submit";
     /// `fn(ptr: u32, len: u32)`: writes a line to the host log.
     pub const LOG: &str = "log";
+    /// `fn(export_ptr: u32, export_len: u32, args_ptr: u32, args_len: u32)
+    /// -> u64`: creates a registered component's retained state (a
+    /// `gpui-component` `InputState`, ...) from postcard-encoded
+    /// `Vec<ComponentArg>` and returns its handle.
+    pub const STATE_NEW: &str = "state_new";
+    /// `fn(handle: u64, export_ptr: u32, export_len: u32, method_ptr: u32,
+    /// method_len: u32, args_ptr: u32, args_len: u32) -> u64`: calls a state
+    /// method with postcard-encoded `Vec<Data>`; returns a packed buffer
+    /// holding the postcard-encoded `Data` result.
+    pub const STATE_CALL: &str = "state_call";
+    /// `fn(handle: u64, export_ptr: u32, export_len: u32, event_ptr: u32,
+    /// event_len: u32, callback: u32)`: runs `callback` on a state's input
+    /// event (`change`, `submit`, `focus`, `blur`) for as long as it lives.
+    pub const STATE_ON: &str = "state_on";
+    /// `fn(key_ptr: u32, key_len: u32) -> u64`: the application's persistent
+    /// store entry (a script's `localStorage.getItem`), as a packed buffer, or
+    /// [`super::ABSENT`] when there is none. Needs the `storage` capability.
+    pub const STORAGE_GET: &str = "storage_get";
+    /// `fn(key_ptr: u32, key_len: u32, value_ptr: u32, value_len: u32)`:
+    /// `localStorage.setItem`.
+    pub const STORAGE_SET: &str = "storage_set";
+    /// `fn(key_ptr: u32, key_len: u32)`: `localStorage.removeItem`.
+    pub const STORAGE_REMOVE: &str = "storage_remove";
+    /// `fn(path_ptr: u32, path_len: u32) -> u64`: a UTF-8 file inside a
+    /// `capabilities.fs.read` root, as a packed buffer. Traps with the
+    /// capability's message when the path is not granted.
+    pub const FS_READ_TEXT: &str = "fs_read_text";
+    /// `fn(path_ptr: u32, path_len: u32, text_ptr: u32, text_len: u32)`:
+    /// writes a file inside a `capabilities.fs.write` root.
+    pub const FS_WRITE_TEXT: &str = "fs_write_text";
+    /// `fn(url_ptr: u32, url_len: u32, callback: u32)`: starts a GET the
+    /// application's network grants allow (traps when they do not) and
+    /// returns at once; `callback` later receives `{"status", "body"}` or
+    /// `{"error"}` as its JSON payload.
+    pub const HTTP_GET: &str = "http_get";
+}
+
+/// What a lookup import returns for "no value", distinct from any packed
+/// buffer (a guest has no allocation at the top of a 32-bit address space).
+pub const ABSENT: u64 = u64::MAX;
+
+/// A plain data value: what a registered state method takes and returns,
+/// mirroring gpui-shell's `ComponentDataValue`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum Data {
+    Null,
+    Boolean(bool),
+    Number(f64),
+    String(String),
+    Array(Vec<Data>),
+    Object(Vec<(String, Data)>),
 }
 
 /// Packs a guest buffer into the single `u64` an export or import returns.
@@ -112,6 +163,8 @@ pub enum ComponentArg {
     Enum(String),
     Element(u32),
     Callback(u32),
+    /// A registered retained state, by the handle `state_new` returned.
+    State(u64),
     Array(Vec<ComponentArg>),
     Optional(Option<Box<ComponentArg>>),
 }
@@ -130,6 +183,10 @@ pub enum Op {
     /// A method a registered component declares (`label`, `primary`,
     /// `value`, ...).
     Component(String, Vec<ComponentArg>),
+    /// A state style (`hover`, `active`, `focus`): the styles recorded on a
+    /// detached node, by its index, applied while the element is in that
+    /// state.
+    StateStyle(String, u32),
 }
 
 /// An argument value, matching gpui-shell's neutral `Bridged` value.

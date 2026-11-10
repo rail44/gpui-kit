@@ -35,8 +35,8 @@ use serde_json::Value;
 
 pub mod prelude {
     pub use crate::{
-        CArg, Cx, Element, Event, Handler, InputState, View, button, checkbox, component, div,
-        export_view, h_flex, input, text, v_flex,
+        CArg, ComponentState, Cx, Data, Element, Event, Handler, InputState, View, button,
+        checkbox, component, div, export_view, h_flex, input, text, v_flex,
     };
 }
 
@@ -123,6 +123,7 @@ enum Kind {
 enum PendingOp {
     Op(Op),
     Component(String, Vec<CArg>),
+    StateStyle(&'static str, Element),
 }
 
 /// An argument to a registered component, before the tree is flattened:
@@ -134,8 +135,106 @@ pub enum CArg {
     Enum(String),
     Element(Element),
     Handler(Handler),
+    /// A registered component's retained state.
+    State(u64),
     Array(Vec<CArg>),
     Optional(Option<Box<CArg>>),
+}
+
+impl From<&ComponentState> for CArg {
+    fn from(state: &ComponentState) -> Self {
+        CArg::State(state.handle)
+    }
+}
+
+pub use abi::Data;
+
+/// A state constructor's argument: plain values only. An element or a
+/// handler has no meaning outside a render, so it becomes `null` and the
+/// host's schema check reports it.
+fn plain_argument(arg: CArg) -> ComponentArg {
+    match arg {
+        CArg::String(value) => ComponentArg::String(value),
+        CArg::Number(value) => ComponentArg::Number(value),
+        CArg::Boolean(value) => ComponentArg::Boolean(value),
+        CArg::Enum(value) => ComponentArg::Enum(value),
+        CArg::State(handle) => ComponentArg::State(handle),
+        CArg::Array(values) => {
+            ComponentArg::Array(values.into_iter().map(plain_argument).collect())
+        }
+        CArg::Optional(value) => {
+            ComponentArg::Optional(value.map(|value| Box::new(plain_argument(*value))))
+        }
+        CArg::Element(_) | CArg::Handler(_) => ComponentArg::Optional(None),
+    }
+}
+
+/// A registered component's retained state (a `gpui-component` `InputState`,
+/// ...), owned by the host like a script's: `ComponentState::new("InputState",
+/// [...])` is a script's `InputState.new(...)` from `"gpui-component"`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ComponentState {
+    export: String,
+    handle: u64,
+}
+
+impl ComponentState {
+    /// Creates the state. Like a script's, only from `init` or a handler.
+    pub fn new(export: &str, args: impl IntoIterator<Item = CArg>) -> Self {
+        let args: Vec<ComponentArg> = args.into_iter().map(plain_argument).collect();
+        let args = postcard::to_allocvec(&args).unwrap_or_default();
+        let handle = unsafe {
+            host::state_new(
+                export.as_ptr() as u32,
+                export.len() as u32,
+                args.as_ptr() as u32,
+                args.len() as u32,
+            )
+        };
+        Self {
+            export: export.to_owned(),
+            handle,
+        }
+    }
+
+    /// Calls one of the state's methods (`value`, `set_value`, ...).
+    pub fn call(&self, method: &str, args: impl IntoIterator<Item = Data>) -> Data {
+        let args = postcard::to_allocvec(&args.into_iter().collect::<Vec<_>>()).unwrap_or_default();
+        let packed = unsafe {
+            host::state_call(
+                self.handle,
+                self.export.as_ptr() as u32,
+                self.export.len() as u32,
+                method.as_ptr() as u32,
+                method.len() as u32,
+                args.as_ptr() as u32,
+                args.len() as u32,
+            )
+        };
+        let bytes = take_bytes(packed);
+        postcard::from_bytes(&bytes).unwrap_or(Data::Null)
+    }
+
+    /// Runs `f` on one of the state's input events (`"submit"`, `"change"`,
+    /// `"focus"`, `"blur"`).
+    pub fn on<V: 'static>(
+        &self,
+        event: &str,
+        cx: &mut Cx<V>,
+        f: impl Fn(&mut V, &Event, &mut Cx<V>) + 'static,
+    ) {
+        let handler = cx.listener(f);
+        unsafe {
+            host::state_on(
+                self.handle,
+                self.export.as_ptr() as u32,
+                self.export.len() as u32,
+                event.as_ptr() as u32,
+                event.len() as u32,
+                handler.0,
+            )
+        }
+    }
 }
 
 impl From<&str> for CArg {
@@ -234,6 +333,27 @@ impl Element {
             name.to_owned(),
             args.into_iter().collect(),
         )));
+        self
+    }
+
+    /// Styles applied while the pointer is over the element:
+    /// `.hover(|style| style.bg("muted"))`.
+    pub fn hover(self, styles: impl FnOnce(Element) -> Element) -> Self {
+        self.state_style("hover", styles)
+    }
+    /// Styles applied while the element is pressed.
+    pub fn active(self, styles: impl FnOnce(Element) -> Element) -> Self {
+        self.state_style("active", styles)
+    }
+    /// Styles applied while the element has focus.
+    pub fn focus(self, styles: impl FnOnce(Element) -> Element) -> Self {
+        self.state_style("focus", styles)
+    }
+
+    fn state_style(mut self, name: &'static str, styles: impl FnOnce(Element) -> Element) -> Self {
+        // The declarations are collected on a detached element, as a script's
+        // are; only its style calls mean anything.
+        self.ops.push(PendingOp::StateStyle(name, styles(div())));
         self
     }
 
@@ -357,6 +477,7 @@ impl Element {
                 CArg::Enum(value) => ComponentArg::Enum(value),
                 CArg::Element(element) => ComponentArg::Element(flatten(element, nodes)),
                 CArg::Handler(handler) => ComponentArg::Callback(handler.0),
+                CArg::State(handle) => ComponentArg::State(handle),
                 CArg::Array(values) => ComponentArg::Array(
                     values
                         .into_iter()
@@ -385,6 +506,9 @@ impl Element {
                         name,
                         args.into_iter().map(|arg| argument(arg, nodes)).collect(),
                     ),
+                    PendingOp::StateStyle(name, styles) => {
+                        Op::StateStyle(name.to_owned(), flatten(styles, nodes))
+                    }
                 })
                 .collect();
             let children = element
@@ -433,6 +557,70 @@ impl InputState {
     }
 }
 
+/// The application's persistent store: a script's `localStorage`, under the
+/// same `storage` capability. Values are strings, as there.
+pub mod storage {
+    use super::host;
+
+    pub fn get(key: &str) -> Option<String> {
+        let packed = unsafe { host::storage_get(key.as_ptr() as u32, key.len() as u32) };
+        (packed != crate::abi::ABSENT).then(|| super::take_string(packed))
+    }
+
+    pub fn set(key: &str, value: &str) {
+        unsafe {
+            host::storage_set(
+                key.as_ptr() as u32,
+                key.len() as u32,
+                value.as_ptr() as u32,
+                value.len() as u32,
+            )
+        }
+    }
+
+    pub fn remove(key: &str) {
+        unsafe { host::storage_remove(key.as_ptr() as u32, key.len() as u32) }
+    }
+}
+
+/// Files inside the application's `capabilities.fs` roots, as a script's
+/// `fs` module reaches them. A path outside every granted root traps the
+/// guest with the capability's message.
+pub mod fs {
+    use super::host;
+
+    pub fn read_text(path: &str) -> String {
+        super::take_string(unsafe { host::fs_read_text(path.as_ptr() as u32, path.len() as u32) })
+    }
+
+    pub fn write_text(path: &str, text: &str) {
+        unsafe {
+            host::fs_write_text(
+                path.as_ptr() as u32,
+                path.len() as u32,
+                text.as_ptr() as u32,
+                text.len() as u32,
+            )
+        }
+    }
+}
+
+/// HTTP under the application's network grants, as a script's `fetch`.
+pub mod http {
+    use super::{Cx, Event, host};
+
+    /// Starts a GET and returns at once. `f` runs later, on the main thread,
+    /// with `{"status": .., "body": ..}` or `{"error": ..}` as its event.
+    pub fn get<V: 'static>(
+        url: &str,
+        cx: &mut Cx<V>,
+        f: impl Fn(&mut V, &Event, &mut Cx<V>) + 'static,
+    ) {
+        let handler = cx.listener(f);
+        unsafe { host::http_get(url.as_ptr() as u32, url.len() as u32, handler.0) }
+    }
+}
+
 /// Writes a line to the host log.
 pub fn log(line: &str) {
     unsafe { host::log(line.as_ptr() as u32, line.len() as u32) }
@@ -447,6 +635,30 @@ mod host {
         pub fn input_set_value(handle: u32, ptr: u32, len: u32);
         pub fn input_on_submit(handle: u32, callback: u32);
         pub fn log(ptr: u32, len: u32);
+        pub fn http_get(url_ptr: u32, url_len: u32, callback: u32);
+        pub fn fs_read_text(path_ptr: u32, path_len: u32) -> u64;
+        pub fn fs_write_text(path_ptr: u32, path_len: u32, text_ptr: u32, text_len: u32);
+        pub fn storage_get(key_ptr: u32, key_len: u32) -> u64;
+        pub fn storage_set(key_ptr: u32, key_len: u32, value_ptr: u32, value_len: u32);
+        pub fn storage_remove(key_ptr: u32, key_len: u32);
+        pub fn state_new(export_ptr: u32, export_len: u32, args_ptr: u32, args_len: u32) -> u64;
+        pub fn state_call(
+            handle: u64,
+            export_ptr: u32,
+            export_len: u32,
+            method_ptr: u32,
+            method_len: u32,
+            args_ptr: u32,
+            args_len: u32,
+        ) -> u64;
+        pub fn state_on(
+            handle: u64,
+            export_ptr: u32,
+            export_len: u32,
+            event_ptr: u32,
+            event_len: u32,
+            callback: u32,
+        );
     }
 }
 
@@ -467,16 +679,47 @@ mod host {
         unimplemented!("gpui-shell host imports exist only in a wasm32 guest")
     }
     pub unsafe fn log(_: u32, _: u32) {}
+    pub unsafe fn http_get(_: u32, _: u32, _: u32) {
+        unimplemented!("gpui-shell host imports exist only in a wasm32 guest")
+    }
+    pub unsafe fn fs_read_text(_: u32, _: u32) -> u64 {
+        unimplemented!("gpui-shell host imports exist only in a wasm32 guest")
+    }
+    pub unsafe fn fs_write_text(_: u32, _: u32, _: u32, _: u32) {
+        unimplemented!("gpui-shell host imports exist only in a wasm32 guest")
+    }
+    pub unsafe fn storage_get(_: u32, _: u32) -> u64 {
+        unimplemented!("gpui-shell host imports exist only in a wasm32 guest")
+    }
+    pub unsafe fn storage_set(_: u32, _: u32, _: u32, _: u32) {
+        unimplemented!("gpui-shell host imports exist only in a wasm32 guest")
+    }
+    pub unsafe fn storage_remove(_: u32, _: u32) {
+        unimplemented!("gpui-shell host imports exist only in a wasm32 guest")
+    }
+    pub unsafe fn state_new(_: u32, _: u32, _: u32, _: u32) -> u64 {
+        unimplemented!("gpui-shell host imports exist only in a wasm32 guest")
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn state_call(_: u64, _: u32, _: u32, _: u32, _: u32, _: u32, _: u32) -> u64 {
+        unimplemented!("gpui-shell host imports exist only in a wasm32 guest")
+    }
+    pub unsafe fn state_on(_: u64, _: u32, _: u32, _: u32, _: u32, _: u32) {
+        unimplemented!("gpui-shell host imports exist only in a wasm32 guest")
+    }
 }
 
 /// Reclaims a buffer the host wrote through the `alloc` export.
 fn take_string(packed: u64) -> String {
+    String::from_utf8(take_bytes(packed)).unwrap_or_default()
+}
+
+fn take_bytes(packed: u64) -> Vec<u8> {
     let (ptr, len) = abi::unpack(packed);
     if len == 0 {
-        return String::new();
+        return Vec::new();
     }
-    let bytes = unsafe { Vec::from_raw_parts(ptr as *mut u8, len as usize, len as usize) };
-    String::from_utf8(bytes).unwrap_or_default()
+    unsafe { Vec::from_raw_parts(ptr as *mut u8, len as usize, len as usize) }
 }
 
 /// Backs the exports `export_view!` generates. Not for direct use.

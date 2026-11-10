@@ -225,6 +225,35 @@ fn authorize_request(
     }
 }
 
+/// `fetch`'s authorization for a caller that is not a script — a WebAssembly
+/// guest's `http_get`. Checked here, on the calling thread, so a denial fails
+/// the call that made it; redirects are checked again inside [`get`].
+#[cfg(feature = "wasm-guest")]
+pub(in crate::engine::quickjs) fn authorized_get(
+    capabilities: &crate::Capabilities,
+    url: &str,
+) -> std::result::Result<reqwest::Url, String> {
+    let url = reqwest::Url::parse(url).map_err(|error| format!("invalid URL `{url}`: {error}"))?;
+    authorize_request(capabilities, &reqwest::Method::GET, &url)?;
+    Ok(url)
+}
+
+/// A GET through the same client and redirect checks as `fetch`, returning
+/// the status and body. Blocking: run it off the main thread.
+#[cfg(feature = "wasm-guest")]
+pub(in crate::engine::quickjs) fn get(
+    capabilities: crate::Capabilities,
+    url: reqwest::Url,
+) -> std::result::Result<(u16, Vec<u8>), String> {
+    // A test talks to a loopback server, which a system proxy must not see.
+    #[cfg(test)]
+    let client = direct_test_client().ok();
+    #[cfg(not(test))]
+    let client = None;
+    request(capabilities, url, FetchOptions::default(), client)
+        .map(|response| (response.status, response.body))
+}
+
 fn request(
     capabilities: crate::Capabilities,
     mut url: reqwest::Url,
