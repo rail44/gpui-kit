@@ -1,0 +1,6 @@
+{
+  "id": "dev.gpui-kit.wasm-grid",
+  "name": "Wasm Grid",
+  "version": "0.1.0",
+  "entry": "grid.wasm"
+}

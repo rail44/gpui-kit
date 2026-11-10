@@ -1,2 +1,6 @@
 /target
 /Cargo.lock
+/app/grid.wasm
+# Written by `gpui-shell check`/`run` (the QuickJS build) for editors.
+/app-js/jsconfig.json
+/app-js/gpui-kit.d.ts

@@ -131,6 +131,9 @@ compile_error!("enable an engine: `quickjs` (the default) or `wasm-engine`");
 compile_error!("`quickjs` and `wasm-engine` are exclusive; build with --no-default-features");
 
 pub(crate) mod component_host;
+// The same applications timed on whichever engine this build has.
+#[cfg(all(test, feature = "components"))]
+mod comparison;
 
 #[cfg(feature = "quickjs")]
 pub(crate) mod quickjs;

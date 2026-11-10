@@ -459,16 +459,22 @@ fn component_argument(
 /// The style methods whose string argument is a color.
 const COLOR_STYLES: &[&str] = &["bg", "text_color", "text_bg", "border_color"];
 
+/// A theme color as the string a script's `cx.theme().colors` hands out: six
+/// digits for an opaque color, so the two engines describe the same tree, and
+/// eight for a translucent one, whose alpha a script's form would drop.
 fn hex(color: gpui::Hsla) -> String {
     let rgba = color.to_rgb();
     let channel = |value: f32| (value.clamp(0., 1.) * 255.).round() as u8;
-    format!(
-        "#{:02x}{:02x}{:02x}{:02x}",
+    let rgb = format!(
+        "#{:02x}{:02x}{:02x}",
         channel(rgba.r),
         channel(rgba.g),
-        channel(rgba.b),
-        channel(rgba.a)
-    )
+        channel(rgba.b)
+    );
+    match channel(rgba.a) {
+        255 => rgb,
+        alpha => format!("{rgb}{alpha:02x}"),
+    }
 }
 
 fn component(component: &abi::Component) -> Component {

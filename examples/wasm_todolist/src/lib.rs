@@ -1,18 +1,18 @@
 //! A todo list, as a WebAssembly guest view.
 //!
-//! The same core as `examples/js_todolist` — a draft input that adds on Enter
+//! The same core as `examples/js_todolist` (a draft input that adds on Enter
 //! or on the Add button, rows with a checkbox and a remove button, a filter,
-//! and a remaining count — written against `gpui-shell-wasm-guest`.
-//!
-//! `app/gpui-shell.json` names the built module as its entry
-//! (`./examples/wasm_todolist/build.sh` puts it there). The shell's CLI still
-//! resolves a fixed `main.js`, so the guest is exercised through the manifest
-//! load path by the host's test:
+//! and a remaining count) written against `gpui-shell-wasm-guest`.
+//! `app-js/main.js` is this view written as a script, element for element.
 //!
 //! ```sh
-//! cargo test -p gpui-shell --no-default-features \
-//!     --features quickjs,components,wasm-guest --lib wasm_guest
+//! examples/wasm_todolist/run.sh      # this guest, on the wasm engine
+//! examples/wasm_todolist/run.sh js   # the script, on QuickJS
+//! scripts/compare-engines.sh         # both, timed side by side
 //! ```
+//!
+//! `app/gpui-shell.json` names the built module as its entry
+//! (`build.sh` puts it there).
 
 use gpui_shell_wasm_guest::prelude::*;
 

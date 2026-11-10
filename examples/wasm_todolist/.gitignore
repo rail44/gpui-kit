@@ -1,6 +1,6 @@
 /target
 /Cargo.lock
 /app/todo.wasm
-# Written by `gpui-shell check`/`run` for editors.
-/app/jsconfig.json
-/app/gpui-kit.d.ts
+# Written by `gpui-shell check`/`run` (the QuickJS build) for editors.
+/app-js/jsconfig.json
+/app-js/gpui-kit.d.ts
