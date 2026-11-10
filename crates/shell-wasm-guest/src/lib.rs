@@ -63,6 +63,8 @@ impl Event {
 type Callback<V> = Rc<dyn Fn(&mut V, &Event, &mut Cx<V>)>;
 
 type PartRenderer<V> = Rc<dyn Fn(&mut V, &mut Cx<V>) -> Element>;
+type ItemRenderer<V> = Rc<dyn Fn(&mut V, std::ops::Range<u32>, &mut Cx<V>) -> Vec<Element>>;
+type ItemKey<V> = Rc<dyn Fn(&V, u32) -> String>;
 
 /// The high bit marks a handler registered outside a render (an input's
 /// submit handler), which lives as long as the view rather than one render.
@@ -78,6 +80,10 @@ pub struct Cx<V> {
     per_render: Vec<Vec<Callback<V>>>,
     persistent: Vec<Callback<V>>,
     parts: Vec<PartRenderer<V>>,
+    /// Lists' item renderers and key functions from the latest render of
+    /// each part, numbered like render handlers.
+    item_renderers: Vec<Vec<ItemRenderer<V>>>,
+    item_keys: Vec<Vec<ItemKey<V>>>,
     rendering: Option<u32>,
     notify: bool,
 }
@@ -107,6 +113,8 @@ impl<V: 'static> Cx<V> {
             per_render: vec![Vec::new()],
             persistent: Vec::new(),
             parts: Vec::new(),
+            item_renderers: vec![Vec::new()],
+            item_keys: vec![Vec::new()],
             rendering: None,
             notify: false,
         }
@@ -139,7 +147,36 @@ impl<V: 'static> Cx<V> {
     pub fn part(&mut self, render: impl Fn(&mut V, &mut Cx<V>) -> Element + 'static) -> Part {
         self.parts.push(Rc::new(render));
         self.per_render.push(Vec::new());
+        self.item_renderers.push(Vec::new());
+        self.item_keys.push(Vec::new());
         Part(self.parts.len() as u32)
+    }
+
+    /// A lazily rendered list of `count` items of one height, as a script's
+    /// `list`: only the visible range is described, during layout, by
+    /// `render` (one element per index in the range it is given); `key`
+    /// names each item so the list keeps the reader's place when items come
+    /// and go. From a render only.
+    pub fn list(
+        &mut self,
+        id: &str,
+        count: u32,
+        render: impl Fn(&mut V, std::ops::Range<u32>, &mut Cx<V>) -> Vec<Element> + 'static,
+        key: impl Fn(&V, u32) -> String + 'static,
+    ) -> Element {
+        let part = self.rendering.expect("a list is described from a render");
+        let renderers = &mut self.item_renderers[part as usize];
+        renderers.push(Rc::new(render));
+        let render_items = (part << PART_SHIFT) | (renderers.len() as u32 - 1);
+        let keys = &mut self.item_keys[part as usize];
+        keys.push(Rc::new(key));
+        let get_key = (part << PART_SHIFT) | (keys.len() as u32 - 1);
+        element(Component::List {
+            id: id.to_owned(),
+            count,
+            render_items,
+            get_key,
+        })
     }
 
     /// Opens `part` as a dialog over the window. From a handler only.
@@ -542,6 +579,13 @@ impl Element {
 
     /// Flattens the tree into the description the host records.
     pub fn into_description(self) -> Description {
+        let mut nodes = Vec::new();
+        let root = self.flatten_into(&mut nodes);
+        Description { root, nodes }
+    }
+
+    /// Appends the tree to `nodes` and returns the root's index.
+    fn flatten_into(self, nodes: &mut Vec<Node>) -> u32 {
         // Post-order: children and element arguments land before the node
         // that refers to them, which is the order the host records in.
         fn argument(arg: CArg, nodes: &mut Vec<Node>) -> ComponentArg {
@@ -599,10 +643,18 @@ impl Element {
             });
             nodes.len() as u32 - 1
         }
-        let mut nodes = Vec::new();
-        let root = flatten(self, &mut nodes);
-        Description { root, nodes }
+        flatten(self, nodes)
     }
+}
+
+/// A list's items, flattened into one node list with a root per item.
+fn items(elements: Vec<Element>) -> abi::Items {
+    let mut nodes = Vec::new();
+    let roots = elements
+        .into_iter()
+        .map(|element| element.flatten_into(&mut nodes))
+        .collect();
+    abi::Items { roots, nodes }
 }
 
 /// A retained text input, owned by the host.
@@ -1034,6 +1086,10 @@ pub struct Guest<V: View> {
     /// The last render's encoded description, kept until the next render so
     /// the pointer handed to the host stays valid while it reads.
     last: Vec<u8>,
+    /// The same for the last item range and the last item key, which the
+    /// host asks for during layout, between renders.
+    last_items: Vec<u8>,
+    last_key: Vec<u8>,
 }
 
 impl<V: View> Default for Guest<V> {
@@ -1042,6 +1098,8 @@ impl<V: View> Default for Guest<V> {
             view: None,
             cx: Cx::new(),
             last: Vec::new(),
+            last_items: Vec::new(),
+            last_key: Vec::new(),
         }
     }
 }
@@ -1062,6 +1120,8 @@ impl<V: View> Guest<V> {
             },
         };
         self.cx.per_render[part as usize].clear();
+        self.cx.item_renderers[part as usize].clear();
+        self.cx.item_keys[part as usize].clear();
         self.cx.rendering = Some(part);
         let element = match renderer {
             None => view.render(&mut self.cx),
@@ -1070,6 +1130,44 @@ impl<V: View> Guest<V> {
         self.cx.rendering = None;
         self.last = postcard::to_allocvec(&element.into_description()).unwrap_or_default();
         abi::pack(self.last.as_ptr() as u32, self.last.len() as u32)
+    }
+
+    /// Describes items `start..end` of a list, during the host's layout. The
+    /// items' handlers join their part's render handlers.
+    pub fn render_items(&mut self, renderer: u32, start: u32, end: u32) -> u64 {
+        let part = renderer >> PART_SHIFT;
+        let found = self
+            .cx
+            .item_renderers
+            .get(part as usize)
+            .and_then(|renderers| renderers.get((renderer & INDEX_MASK) as usize))
+            .cloned();
+        let (Some(render), Some(view)) = (found, self.view.as_mut()) else {
+            return abi::pack(0, 0);
+        };
+        self.cx.rendering = Some(part);
+        let elements = render(view, start..end, &mut self.cx);
+        self.cx.rendering = None;
+        self.last_items = postcard::to_allocvec(&items(elements)).unwrap_or_default();
+        abi::pack(
+            self.last_items.as_ptr() as u32,
+            self.last_items.len() as u32,
+        )
+    }
+
+    /// The key of a list's item.
+    pub fn item_key(&mut self, get_key: u32, index: u32) -> u64 {
+        let found = self
+            .cx
+            .item_keys
+            .get((get_key >> PART_SHIFT) as usize)
+            .and_then(|keys| keys.get((get_key & INDEX_MASK) as usize))
+            .cloned();
+        let (Some(key), Some(view)) = (found, self.view.as_ref()) else {
+            return abi::pack(0, 0);
+        };
+        self.last_key = key(view, index).into_bytes();
+        abi::pack(self.last_key.as_ptr() as u32, self.last_key.len() as u32)
     }
 
     pub fn dispatch(&mut self, callback: u32, payload: Vec<u8>) -> u32 {
@@ -1117,6 +1215,16 @@ macro_rules! export_view {
         #[unsafe(no_mangle)]
         pub extern "C" fn gpui_shell_render(part: u32) -> u64 {
             GUEST.with(|guest| guest.borrow_mut().render(part))
+        }
+
+        #[unsafe(no_mangle)]
+        pub extern "C" fn gpui_shell_render_items(renderer: u32, start: u32, end: u32) -> u64 {
+            GUEST.with(|guest| guest.borrow_mut().render_items(renderer, start, end))
+        }
+
+        #[unsafe(no_mangle)]
+        pub extern "C" fn gpui_shell_item_key(get_key: u32, index: u32) -> u64 {
+            GUEST.with(|guest| guest.borrow_mut().item_key(get_key, index))
         }
 
         #[unsafe(no_mangle)]

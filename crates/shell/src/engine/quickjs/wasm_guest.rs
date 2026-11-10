@@ -192,6 +192,58 @@ pub(super) fn install(ctx: &Ctx<'_>, runtime: Weak<ShellRuntime>) -> JsResult<()
         "globalThis.__wasm_part_view = (guest, part) => \
          ({ render(_cx) { return { __id: __wasm_render(guest, part) }; } });",
     )?;
+    // A list's item renderer and key function as a script's `list` hands
+    // them over: the host calls them during layout.
+    ctx.eval::<(), _>(
+        "globalThis.__wasm_list_items = (guest, renderer) => (range) => \
+         __wasm_render_items(guest, renderer, range.start, range.end).map((id) => ({ __id: id })); \
+         globalThis.__wasm_list_key = (guest, getKey) => (index) => \
+         __wasm_item_key(guest, getKey, index);",
+    )?;
+
+    let items_runtime = runtime.clone();
+    globals.set(
+        "__wasm_render_items",
+        Func::from(
+            move |ctx: Ctx<'_>,
+                  guest: u32,
+                  renderer: u32,
+                  start: u32,
+                  end: u32|
+                  -> JsResult<Vec<u32>> {
+                let runtime = items_runtime
+                    .upgrade()
+                    .ok_or_else(|| js_error::type_error(&ctx, "the shell runtime is gone"))?;
+                let guest = guest_by_id(guest)
+                    .ok_or_else(|| js_error::type_error(&ctx, "unknown wasm guest"))?;
+                let items = guest
+                    .render_items(renderer, start, end)
+                    .map_err(|error| js_error::type_error(&ctx, &format!("{error:#}")))?;
+                let ids = record_nodes(&ctx, &runtime, &guest, &items.nodes)?;
+                items
+                    .roots
+                    .iter()
+                    .map(|root| {
+                        ids.get(*root as usize).copied().ok_or_else(|| {
+                            js_error::type_error(&ctx, "an item root is out of range")
+                        })
+                    })
+                    .collect()
+            },
+        ),
+    )?;
+    globals.set(
+        "__wasm_item_key",
+        Func::from(
+            |ctx: Ctx<'_>, guest: u32, get_key: u32, index: u32| -> JsResult<String> {
+                let guest = guest_by_id(guest)
+                    .ok_or_else(|| js_error::type_error(&ctx, "unknown wasm guest"))?;
+                guest
+                    .item_key(get_key, index)
+                    .map_err(|error| js_error::type_error(&ctx, &format!("{error:#}")))
+            },
+        ),
+    )?;
 
     globals.set(
         "__wasm_render",
@@ -230,13 +282,26 @@ fn record(
     guest: &Rc<Guest>,
     description: &Description,
 ) -> JsResult<SpecId> {
+    let ids = record_nodes(ctx, runtime, guest, &description.nodes)?;
+    ids.get(description.root as usize)
+        .copied()
+        .ok_or_else(|| js_error::type_error(ctx, "the description has no root"))
+}
+
+/// Records nodes into the runtime's scratch arena and returns each one's id.
+fn record_nodes(
+    ctx: &Ctx<'_>,
+    runtime: &Rc<ShellRuntime>,
+    guest: &Rc<Guest>,
+    nodes: &[abi::Node],
+) -> JsResult<Vec<SpecId>> {
     let fail = |message: String| js_error::type_error(ctx, &message);
     // Nodes arrive after everything they refer to, so each one is finished —
     // constructed, its calls recorded, its children attached — before the
     // next, exactly the order a script's builder chain records in.
-    let mut ids: Vec<SpecId> = Vec::with_capacity(description.nodes.len());
+    let mut ids: Vec<SpecId> = Vec::with_capacity(nodes.len());
 
-    for node in &description.nodes {
+    for node in nodes {
         let id = match &node.component {
             abi::Component::Registered { export, args } => {
                 let (component_id, name, constructor) = runtime
@@ -265,6 +330,33 @@ fn record(
                 ))
             }
             abi::Component::Nested(part) => nested_view(ctx, runtime, guest, *part)?,
+            abi::Component::List {
+                id,
+                count,
+                render_items,
+                get_key,
+            } => {
+                // The renderer and key function go into the open callback
+                // generation as functions, exactly where a script's `list`
+                // puts its own.
+                let items: Function = ctx
+                    .globals()
+                    .get::<_, Function>("__wasm_list_items")?
+                    .call((guest.id.get(), *render_items))?;
+                let key: Function = ctx
+                    .globals()
+                    .get::<_, Function>("__wasm_list_key")?
+                    .call((guest.id.get(), *get_key))?;
+                let render_items = register_function(ctx, runtime, items);
+                let get_key = register_function(ctx, runtime, key);
+                runtime.push_component(Component::List(Rc::new(crate::spec::ListSpec::new(
+                    id.clone(),
+                    crate::spec::ListKind::Uniform,
+                    *count as usize,
+                    get_key,
+                    render_items,
+                ))))
+            }
             other => runtime.push_component(component(other)),
         };
         ids.push(id);
@@ -366,9 +458,7 @@ fn record(
         }
     }
 
-    ids.get(description.root as usize)
-        .copied()
-        .ok_or_else(|| fail("the description has no root".to_owned()))
+    Ok(ids)
 }
 
 /// What the arguments of one registered constructor or method are checked
@@ -537,9 +627,9 @@ fn component(component: &abi::Component) -> Component {
         abi::Component::Button(id) => Component::Button(id.clone()),
         abi::Component::Checkbox(id) => Component::Checkbox(id.clone()),
         abi::Component::Input(handle) => Component::Input(EntityHandle::from(*handle)),
-        abi::Component::Registered { .. } | abi::Component::Nested(_) => {
-            unreachable!("recorded by `record`")
-        }
+        abi::Component::Registered { .. }
+        | abi::Component::Nested(_)
+        | abi::Component::List { .. } => unreachable!("recorded by `record_nodes`"),
     }
 }
 
@@ -610,13 +700,23 @@ fn register(
             Ok(())
         },
     )?;
+    Ok(register_function(ctx, runtime, function))
+}
+
+/// Puts a function into the open callback generation, owned by the current
+/// view and application.
+fn register_function<'js>(
+    ctx: &Ctx<'js>,
+    runtime: &Rc<ShellRuntime>,
+    function: Function<'js>,
+) -> crate::spec::CallbackId {
     let saved = Persistent::save(ctx, function);
-    Ok(runtime.callbacks.borrow_mut().push(CallbackEntry {
+    runtime.callbacks.borrow_mut().push(CallbackEntry {
         value: saved,
         view: scope::current_view().map(|view| view.downgrade()),
         application: scope::current_application_generation(),
         registered_in: scope::current_generation(),
-    }))
+    })
 }
 
 /// What a script's `cx.notify()` does for its own view — invalidate the
@@ -739,6 +839,8 @@ struct Guest {
     store: RefCell<Store<HostState>>,
     memory: Memory,
     render: TypedFunc<u32, u64>,
+    render_items: TypedFunc<(u32, u32, u32), u64>,
+    item_key: TypedFunc<(u32, u32), u64>,
     dispatch: TypedFunc<(u32, u32, u32), u32>,
     alloc: TypedFunc<u32, u32>,
     /// The application generation the guest belongs to; [`release`] drops it
@@ -809,6 +911,8 @@ impl Guest {
             .get_memory(&mut store, "memory")
             .ok_or_else(|| anyhow!("the guest exports no memory"))?;
         let render = instance.get_typed_func(&mut store, abi::export::RENDER)?;
+        let render_items = instance.get_typed_func(&mut store, abi::export::RENDER_ITEMS)?;
+        let item_key = instance.get_typed_func(&mut store, abi::export::ITEM_KEY)?;
         let dispatch = instance.get_typed_func(&mut store, abi::export::DISPATCH)?;
         let alloc = instance.get_typed_func(&mut store, abi::export::ALLOC)?;
         let init: TypedFunc<(), ()> = instance.get_typed_func(&mut store, abi::export::INIT)?;
@@ -817,6 +921,8 @@ impl Guest {
             store: RefCell::new(store),
             memory,
             render,
+            render_items,
+            item_key,
             dispatch,
             alloc,
             application: scope::current_application_generation(),
@@ -856,6 +962,27 @@ impl Guest {
             .map_err(|error| anyhow!("guest render failed: {error:#}"))?;
         let bytes = read(&self.memory, &*store, packed)?;
         postcard::from_bytes(&bytes).context("guest returned a malformed description")
+    }
+
+    /// Describes items `start..end` of one of the guest's lists.
+    fn render_items(&self, renderer: u32, start: u32, end: u32) -> Result<abi::Items> {
+        let mut store = self.store.borrow_mut();
+        let packed = self
+            .render_items
+            .call(&mut *store, (renderer, start, end))
+            .map_err(|error| anyhow!("guest item renderer failed: {error:#}"))?;
+        let bytes = read(&self.memory, &*store, packed)?;
+        postcard::from_bytes(&bytes).context("guest returned malformed items")
+    }
+
+    /// The key of one of the guest's list items.
+    fn item_key(&self, get_key: u32, index: u32) -> Result<String> {
+        let mut store = self.store.borrow_mut();
+        let packed = self
+            .item_key
+            .call(&mut *store, (get_key, index))
+            .map_err(|error| anyhow!("guest item key failed: {error:#}"))?;
+        Ok(String::from_utf8(read(&self.memory, &*store, packed)?)?)
     }
 
     /// Runs guest handler `callback`. Returns whether it asked to re-render.
@@ -2861,6 +2988,33 @@ mod tests {
         // guest asked for.
         assert!(tree.contains("Messages: hello,echo ping"), "{tree}");
         assert!(tree.contains("Closed: true"), "{tree}");
+    }
+
+    #[gpui::test]
+    fn a_guest_list_describes_only_the_rows_on_screen(cx: &mut TestAppContext) {
+        let mut app = Harness::load_example(cx, "wasm_list");
+        // Layout has asked the guest for the visible rows; a render shows
+        // which ones.
+        let view = app.view.clone();
+        app.context
+            .update(|_, cx| view.update(cx, |view, cx| view.refresh(cx)));
+        app.settle();
+        let tree = app.tree();
+        let asked = tree
+            .lines()
+            .find_map(|line| line.split("Asked: ").nth(1))
+            .map(|range| range.trim_end_matches('"').to_owned())
+            .unwrap_or_default();
+        let (start, end) = asked
+            .split_once("..")
+            .map(|(start, end)| (start.parse::<u32>().unwrap(), end.parse::<u32>().unwrap()))
+            .unwrap_or_else(|| panic!("the list asked for no rows: {tree}"));
+        assert_eq!(start, 0, "{tree}");
+        assert!(
+            end > 0 && end < 200,
+            "ten thousand rows, but only the visible few are described: {asked}"
+        );
+        assert!(tree.contains("uniform_list \"rows\" ×10000"), "{tree}");
     }
 
     #[gpui::test]

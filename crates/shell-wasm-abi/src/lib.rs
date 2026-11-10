@@ -34,6 +34,19 @@ pub mod export {
     /// handler with a JSON-encoded event payload. Returns 1 when the handler
     /// asked for a re-render, 0 otherwise.
     pub const DISPATCH: &str = "gpui_shell_dispatch";
+    /// `fn(renderer: u32, start: u32, end: u32) -> u64`: describes a list's
+    /// items `start..end` as a packed postcard-encoded [`super::Items`].
+    pub const RENDER_ITEMS: &str = "gpui_shell_render_items";
+    /// `fn(get_key: u32, index: u32) -> u64`: the key of a list's item, as
+    /// a packed UTF-8 buffer.
+    pub const ITEM_KEY: &str = "gpui_shell_item_key";
+}
+
+/// One range of a list's items: the nodes, and which of them is each item.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Items {
+    pub roots: Vec<u32>,
+    pub nodes: Vec<Node>,
 }
 
 /// Host imports, all under [`IMPORT_MODULE`].
@@ -198,6 +211,16 @@ pub enum Component {
     /// A part of the guest drawn in place by a view of its own (a script's
     /// child view), by the part number the guest registered.
     Nested(u32),
+    /// A lazily rendered list of `count` uniform items: the host asks for
+    /// the visible range during layout through the guest's
+    /// [`export::RENDER_ITEMS`] with `render_items`, and for item keys
+    /// through [`export::ITEM_KEY`] with `get_key` — a script's `list`.
+    List {
+        id: String,
+        count: u32,
+        render_items: u32,
+        get_key: u32,
+    },
     /// A component the host's catalog registered (`gpui-component`'s
     /// `Button`, `Tag`, `Progress`, ...), by its constructor's export name.
     Registered {
