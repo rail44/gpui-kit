@@ -19,7 +19,7 @@ mod fs;
 mod net;
 mod os;
 mod process;
-mod websocket;
+pub(in crate::engine::quickjs) mod websocket;
 
 #[cfg(test)]
 pub(super) fn direct_test_http_client()

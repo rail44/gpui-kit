@@ -117,7 +117,35 @@ pub(super) fn release(application: &Rc<ApplicationGeneration>) {
             .filter_map(Option::take)
             .collect()
     });
+    // Processes and sockets outlive nothing they were started for.
+    for guest in &released {
+        for resource in guest.resources.borrow_mut().drain(..).flatten() {
+            resource.stop();
+        }
+    }
     drop(released);
+}
+
+/// Something a guest started that runs on its own until stopped.
+enum Resource {
+    Process(crate::process::Killer),
+    Socket(std::sync::mpsc::Sender<SocketCommand>),
+}
+
+impl Resource {
+    fn stop(self) {
+        match self {
+            Resource::Process(killer) => killer.kill(),
+            Resource::Socket(commands) => {
+                let _ = commands.send(SocketCommand::Close);
+            }
+        }
+    }
+}
+
+enum SocketCommand {
+    Send(String),
+    Close,
 }
 
 /// How many guest instances are live, for tests.
@@ -725,6 +753,16 @@ struct Guest {
     nested: RefCell<HashMap<u32, EntityHandle>>,
     /// Parts the guest asked to open as dialogs, not yet opened.
     pending_dialogs: RefCell<Vec<u32>>,
+    /// Processes and sockets the guest started, by the id it was handed.
+    resources: RefCell<Vec<Option<Resource>>>,
+}
+
+impl Guest {
+    fn add_resource(&self, resource: Resource) -> u32 {
+        let mut resources = self.resources.borrow_mut();
+        resources.push(Some(resource));
+        resources.len() as u32 - 1
+    }
 }
 
 struct HostState {
@@ -791,6 +829,7 @@ impl Guest {
             ),
             nested: RefCell::new(HashMap::new()),
             pending_dialogs: RefCell::new(Vec::new()),
+            resources: RefCell::new(Vec::new()),
         });
         guest.store.borrow_mut().data_mut().guest = Rc::downgrade(&guest);
 
@@ -1132,6 +1171,129 @@ fn get_method() -> String {
     "GET".to_owned()
 }
 
+/// Hands each event from `events` to the guest's handler `callback` on the
+/// main thread, until `to_json` marks one as the last or the guest is gone:
+/// the shape of every stream a guest starts (a process's output, a socket's
+/// messages), since a core module has no async iterator to drive.
+fn stream_to_guest<T: 'static>(
+    guest: Weak<Guest>,
+    callback: u32,
+    events: async_channel::Receiver<T>,
+    to_json: impl Fn(T) -> (serde_json::Value, bool) + 'static,
+) -> Result<()> {
+    // Polled rather than awaited, as a script's streams are: the producer is
+    // an OS thread, and a wake from one is not a foreground schedule GPUI's
+    // deterministic test executor accepts.
+    const STREAM_POLL: std::time::Duration = std::time::Duration::from_millis(16);
+    scope::with_current(|window, cx| {
+        window
+            .spawn(cx, async move |cx| {
+                loop {
+                    let event = match events.try_recv() {
+                        Ok(event) => event,
+                        Err(async_channel::TryRecvError::Empty) => {
+                            cx.background_executor().timer(STREAM_POLL).await;
+                            continue;
+                        }
+                        Err(async_channel::TryRecvError::Closed) => break,
+                    };
+                    let (payload, last) = to_json(event);
+                    let payload = payload.to_string();
+                    let delivered = cx.update(|window, app| match guest.upgrade() {
+                        Some(guest) => {
+                            guest.dispatch_native_with(callback, payload.as_bytes(), window, app);
+                            true
+                        }
+                        None => false,
+                    });
+                    if last || !matches!(delivered, Ok(true)) {
+                        break;
+                    }
+                }
+            })
+            .detach();
+    })
+    .ok_or_else(|| anyhow!("a stream needs a live host call"))
+}
+
+/// A socket's owner: one thread that interleaves reads (on the read slice the
+/// handshake set) with the guest's sends, until either side closes.
+fn run_guest_socket(
+    url: String,
+    host_name: String,
+    port: u16,
+    commands: std::sync::mpsc::Receiver<SocketCommand>,
+    events: async_channel::Sender<serde_json::Value>,
+) {
+    use tungstenite::Message;
+    let mut socket = match super::standard::websocket::guest_handshake(url, host_name, port) {
+        Ok(socket) => socket,
+        Err(error) => {
+            let _ = events.send_blocking(serde_json::json!({ "error": error }));
+            return;
+        }
+    };
+    if events
+        .send_blocking(serde_json::json!({ "open": true }))
+        .is_err()
+    {
+        return;
+    }
+    loop {
+        match commands.try_recv() {
+            Ok(SocketCommand::Send(text)) => {
+                if let Err(error) = socket.send(Message::text(text)) {
+                    let _ = events.send_blocking(serde_json::json!({ "error": error.to_string() }));
+                    return;
+                }
+            }
+            Ok(SocketCommand::Close) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                let _ = socket.close(None);
+                let _ = socket.flush();
+                let _ = events.send_blocking(serde_json::json!({ "close": true }));
+                return;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+        match socket.read() {
+            Ok(Message::Text(text)) => {
+                if events
+                    .send_blocking(serde_json::json!({ "message": text.as_str() }))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            Ok(Message::Close(_)) => {
+                let _ = events.send_blocking(serde_json::json!({ "close": true }));
+                return;
+            }
+            Ok(_) => {}
+            Err(tungstenite::Error::Io(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) => {
+                let _ = events.send_blocking(serde_json::json!({ "close": true }));
+                return;
+            }
+            Err(error) => {
+                let _ = events.send_blocking(serde_json::json!({ "error": error.to_string() }));
+                return;
+            }
+        }
+    }
+}
+
+/// A process a guest streams, as JSON.
+#[derive(serde::Deserialize)]
+struct GuestSpawn {
+    command: String,
+    #[serde(default)]
+    args: Vec<String>,
+}
+
 /// A toast a guest asks for, as JSON.
 #[derive(serde::Deserialize)]
 struct GuestToast {
@@ -1341,6 +1503,128 @@ fn link_imports(linker: &mut Linker<HostState>) -> Result<()> {
                     Err(error) => serde_json::json!({ "error": error }),
                 }
             })
+        },
+    )?;
+    // Streams: a process's output line by line, and a WebSocket's messages.
+    // Each hands every event to the same guest handler until it ends.
+    linker.func_wrap(
+        module,
+        abi::import::PROCESS_SPAWN,
+        |mut caller: Caller<'_, HostState>,
+         request_ptr: u32,
+         request_len: u32,
+         callback: u32|
+         -> Result<u32> {
+            let request: GuestSpawn =
+                serde_json::from_slice(&read_bytes(&mut caller, request_ptr, request_len)?)?;
+            anyhow::ensure!(
+                scope::policy().capabilities().may_run(&request.command),
+                "{}",
+                crate::capability::CapabilityError::ExecuteDenied(request.command.clone())
+            );
+            let spawned = crate::process::spawn_streaming(
+                &request.command,
+                &request.args,
+                crate::process::SpawnOptions {
+                    cwd: None,
+                    stdin: false,
+                    timeout: None,
+                    lines: true,
+                },
+            )
+            .map_err(|error| anyhow!(error))?;
+            let guest = caller
+                .data()
+                .guest
+                .upgrade()
+                .ok_or_else(|| anyhow!("the guest is gone"))?;
+            let id = guest.add_resource(Resource::Process(spawned.killer.clone()));
+            stream_to_guest(Rc::downgrade(&guest), callback, spawned.events, |event| {
+                use crate::process::ProcessEvent;
+                match event {
+                    ProcessEvent::Stdout(line) => (serde_json::json!({ "stdout": line }), false),
+                    ProcessEvent::Stderr(line) => (serde_json::json!({ "stderr": line }), false),
+                    ProcessEvent::Exit {
+                        code,
+                        signal,
+                        error,
+                    } => (
+                        serde_json::json!({ "exit": { "code": code, "signal": signal, "error": error } }),
+                        true,
+                    ),
+                }
+            })?;
+            Ok(id)
+        },
+    )?;
+    linker.func_wrap(
+        module,
+        abi::import::RESOURCE_STOP,
+        |caller: Caller<'_, HostState>, id: u32| -> Result<()> {
+            let guest = caller
+                .data()
+                .guest
+                .upgrade()
+                .ok_or_else(|| anyhow!("the guest is gone"))?;
+            let resource = guest
+                .resources
+                .borrow_mut()
+                .get_mut(id as usize)
+                .and_then(Option::take);
+            if let Some(resource) = resource {
+                resource.stop();
+            }
+            Ok(())
+        },
+    )?;
+    linker.func_wrap(
+        module,
+        abi::import::SOCKET_OPEN,
+        |mut caller: Caller<'_, HostState>,
+         url_ptr: u32,
+         url_len: u32,
+         callback: u32|
+         -> Result<u32> {
+            let url = read_string(&mut caller, url_ptr, url_len)?;
+            let (url, host_name, port) = super::standard::websocket::authorize_guest_socket(
+                scope::policy().capabilities(),
+                &url,
+            )
+            .map_err(|error| anyhow!(error))?;
+            let guest = caller
+                .data()
+                .guest
+                .upgrade()
+                .ok_or_else(|| anyhow!("the guest is gone"))?;
+            let (commands, received) = std::sync::mpsc::channel();
+            let (events, incoming) = async_channel::unbounded();
+            std::thread::Builder::new()
+                .name("gpui-wasm-guest-socket".to_owned())
+                .spawn(move || run_guest_socket(url, host_name, port, received, events))?;
+            let id = guest.add_resource(Resource::Socket(commands));
+            stream_to_guest(Rc::downgrade(&guest), callback, incoming, |event| {
+                let last = event.get("close").is_some() || event.get("error").is_some();
+                (event, last)
+            })?;
+            Ok(id)
+        },
+    )?;
+    linker.func_wrap(
+        module,
+        abi::import::SOCKET_SEND,
+        |mut caller: Caller<'_, HostState>, id: u32, text_ptr: u32, text_len: u32| -> Result<()> {
+            let text = read_string(&mut caller, text_ptr, text_len)?;
+            let guest = caller
+                .data()
+                .guest
+                .upgrade()
+                .ok_or_else(|| anyhow!("the guest is gone"))?;
+            match guest.resources.borrow().get(id as usize) {
+                Some(Some(Resource::Socket(commands))) => commands
+                    .send(SocketCommand::Send(text))
+                    .map_err(|_| anyhow!("socket {id} is closed")),
+                _ => Err(anyhow!("no open socket {id}")),
+            }
         },
     )?;
     // Overlays, from a handler or a task only, as a script's are.
@@ -2501,6 +2785,82 @@ mod tests {
             std::fs::read_to_string(data.join("notes.txt.async")).unwrap(),
             "ASYNC"
         );
+    }
+
+    /// A WebSocket server for one client: greets it, echoes one message back
+    /// with a prefix, then waits for the close.
+    fn serve_websocket_once() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut socket = tungstenite::accept(stream).unwrap();
+            socket.send(tungstenite::Message::text("hello")).unwrap();
+            loop {
+                match socket.read() {
+                    Ok(tungstenite::Message::Text(text)) => {
+                        socket
+                            .send(tungstenite::Message::text(format!(
+                                "echo {}",
+                                text.as_str()
+                            )))
+                            .unwrap();
+                    }
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+        });
+        port
+    }
+
+    #[gpui::test]
+    fn a_guest_receives_streams_event_by_event(cx: &mut TestAppContext) {
+        let port = serve_websocket_once();
+        let directory = application("wasm_streams");
+        let store = directory.join("store.json");
+        std::fs::write(
+            &store,
+            serde_json::json!({ "socket_url": format!("ws://127.0.0.1:{port}/") }).to_string(),
+        )
+        .unwrap();
+        cx.update(|cx| crate::init(cx));
+        crate::set_storage_path(store);
+        crate::set_capabilities(
+            crate::Capabilities::new()
+                .storage(true)
+                .network_hosts(["127.0.0.1".to_owned()])
+                .execute(crate::ExecuteGrant::Allowed(vec!["seq".to_owned()])),
+        );
+        let runtime = ShellRuntime::new_isolated().expect("runtime");
+        cx.update(|cx| runtime.set_global(cx));
+        let window = cx.add_window(|_, _| gpui::Empty);
+        let mut context = VisualTestContext::from_window(*window.deref(), cx);
+        let view_type = runtime.load_app(&directory, "guest.wasm").expect("load");
+        let view = context
+            .update(|window, cx| runtime.instantiate_view(&view_type, window, cx))
+            .expect("instantiate");
+
+        let mut tree = String::new();
+        for _ in 0..300 {
+            // The streams are polled on a timer, which the test clock drives.
+            context
+                .executor()
+                .advance_clock(std::time::Duration::from_millis(20));
+            context.run_until_parked();
+            tree = drawn_tree(&mut context, &view);
+            if tree.contains("Exit: 0") && tree.contains("Closed: true") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // One handler call per line, then one for the exit.
+        assert!(tree.contains("Lines: 1,2,3"), "{tree}");
+        assert!(tree.contains("Exit: 0"), "{tree}");
+        // The greeting, the echo of the guest's reply, then the close the
+        // guest asked for.
+        assert!(tree.contains("Messages: hello,echo ping"), "{tree}");
+        assert!(tree.contains("Closed: true"), "{tree}");
     }
 
     #[gpui::test]

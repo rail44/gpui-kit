@@ -768,6 +768,61 @@ pub mod process {
     }
 }
 
+/// Something the guest started that runs until it ends or is stopped: a
+/// streamed process or a socket.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Resource(u32);
+
+impl Resource {
+    /// Kills the process or closes the socket.
+    pub fn stop(self) {
+        unsafe { host::resource_stop(self.0) }
+    }
+}
+
+/// A process whose output arrives as it is written, as a script's
+/// `process.spawn`.
+pub mod process_stream {
+    use super::{Cx, Event, Resource, host};
+
+    /// Starts `command`; `f` receives each line as `{"stdout"}` or
+    /// `{"stderr"}`, then `{"exit": {"code", "signal", "error"}}`.
+    pub fn spawn<V: 'static>(
+        command: &str,
+        args: &[&str],
+        cx: &mut Cx<V>,
+        f: impl Fn(&mut V, &Event, &mut Cx<V>) + 'static,
+    ) -> Resource {
+        let request = serde_json::json!({ "command": command, "args": args }).to_string();
+        let handler = cx.listener(f);
+        Resource(unsafe {
+            host::process_spawn(request.as_ptr() as u32, request.len() as u32, handler.0)
+        })
+    }
+}
+
+/// WebSockets under the application's network grants, as a script's
+/// `WebSocket.connect`.
+pub mod socket {
+    use super::{Cx, Event, Resource, host};
+
+    /// Opens `url`; `f` receives `{"open"}`, each `{"message"}`, then
+    /// `{"close"}` or `{"error"}`.
+    pub fn open<V: 'static>(
+        url: &str,
+        cx: &mut Cx<V>,
+        f: impl Fn(&mut V, &Event, &mut Cx<V>) + 'static,
+    ) -> Resource {
+        let handler = cx.listener(f);
+        Resource(unsafe { host::socket_open(url.as_ptr() as u32, url.len() as u32, handler.0) })
+    }
+
+    /// Sends a text message on an open socket.
+    pub fn send(socket: Resource, text: &str) {
+        unsafe { host::socket_send(socket.0, text.as_ptr() as u32, text.len() as u32) }
+    }
+}
+
 /// This run's in-memory store: a script's `sessionStorage`. No capability,
 /// nothing reaches the disk.
 pub mod session_storage {
@@ -818,6 +873,10 @@ mod host {
         pub fn input_set_value(handle: u32, ptr: u32, len: u32);
         pub fn input_on_submit(handle: u32, callback: u32);
         pub fn log(ptr: u32, len: u32);
+        pub fn process_spawn(request_ptr: u32, request_len: u32, callback: u32) -> u32;
+        pub fn socket_open(url_ptr: u32, url_len: u32, callback: u32) -> u32;
+        pub fn socket_send(id: u32, text_ptr: u32, text_len: u32);
+        pub fn resource_stop(id: u32);
         pub fn open_dialog(part: u32);
         pub fn close_dialog();
         pub fn push_toast(toast_ptr: u32, toast_len: u32);
@@ -879,6 +938,18 @@ mod host {
         unimplemented!("gpui-shell host imports exist only in a wasm32 guest")
     }
     pub unsafe fn log(_: u32, _: u32) {}
+    pub unsafe fn process_spawn(_: u32, _: u32, _: u32) -> u32 {
+        unimplemented!("gpui-shell host imports exist only in a wasm32 guest")
+    }
+    pub unsafe fn socket_open(_: u32, _: u32, _: u32) -> u32 {
+        unimplemented!("gpui-shell host imports exist only in a wasm32 guest")
+    }
+    pub unsafe fn socket_send(_: u32, _: u32, _: u32) {
+        unimplemented!("gpui-shell host imports exist only in a wasm32 guest")
+    }
+    pub unsafe fn resource_stop(_: u32) {
+        unimplemented!("gpui-shell host imports exist only in a wasm32 guest")
+    }
     pub unsafe fn open_dialog(_: u32) {
         unimplemented!("gpui-shell host imports exist only in a wasm32 guest")
     }

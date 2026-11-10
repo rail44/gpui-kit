@@ -272,6 +272,72 @@ fn outgoing_message<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> Result<Message> {
     Ok(Message::Binary(bytes.into()))
 }
 
+/// What a WebSocket a caller that is not a script — a WebAssembly guest —
+/// holds: the connected socket, with the read slice set so its owner can
+/// interleave reads and writes on one thread.
+#[cfg(feature = "wasm-guest")]
+pub(in crate::engine::quickjs) type GuestSocket = WebSocket<MaybeTlsStream<TcpStream>>;
+
+/// `WebSocket.connect`'s URL check, authorization and handshake for a caller
+/// that is not a script. The authorization runs here, on the calling thread
+/// (the caller passes the grants), so a denial fails the call that made it;
+/// the connection is the caller's to make off the main thread with
+/// [`guest_handshake`].
+#[cfg(feature = "wasm-guest")]
+pub(in crate::engine::quickjs) fn authorize_guest_socket(
+    capabilities: &crate::Capabilities,
+    url: &str,
+) -> std::result::Result<(String, String, u16), String> {
+    let parsed =
+        reqwest::Url::parse(url).map_err(|error| format!("invalid WebSocket URL: {error}"))?;
+    if !matches!(parsed.scheme(), "ws" | "wss") {
+        return Err("a WebSocket expects a ws:// or wss:// URL".to_owned());
+    }
+    let host_name = parsed
+        .host_str()
+        .ok_or("WebSocket URL has no host")?
+        .to_owned();
+    if !capabilities.may_reach(&host_name) {
+        return Err(format!(
+            "network access to `{host_name}` is not granted; add it to capabilities.network.hosts"
+        ));
+    }
+    let port = parsed
+        .port_or_known_default()
+        .ok_or("WebSocket URL has no port and no known default")?;
+    Ok((url.to_owned(), host_name, port))
+}
+
+/// The handshake `WebSocket.connect` performs. Blocking.
+#[cfg(feature = "wasm-guest")]
+pub(in crate::engine::quickjs) fn guest_handshake(
+    url: String,
+    host_name: String,
+    port: u16,
+) -> std::result::Result<GuestSocket, String> {
+    let config = WebSocketConfig::default()
+        .max_message_size(Some(MESSAGE_LIMIT))
+        .max_frame_size(Some(MESSAGE_LIMIT));
+    let mut request = url
+        .into_client_request()
+        .map_err(|error| format!("WebSocket handshake failed: {error}"))?;
+    request
+        .headers_mut()
+        .entry(tungstenite::http::header::USER_AGENT)
+        .or_insert(HeaderValue::from_static(super::USER_AGENT));
+    let operation = format!("WebSocket host {host_name}:{port}");
+    let (stream, _deadline) =
+        network_connect::connect_tcp(&host_name, port, IO_TIMEOUT, &operation)
+            .map_err(|error| format!("WebSocket connection failed: {error}"))?;
+    stream
+        .set_read_timeout(Some(IO_TIMEOUT))
+        .map_err(|error| format!("setting WebSocket handshake timeout failed: {error}"))?;
+    let (mut socket, _) = tungstenite::client_tls_with_config(request, stream, Some(config), None)
+        .map_err(|error| format!("WebSocket handshake failed: {error}"))?;
+    set_timeouts(&mut socket)?;
+    Ok(socket)
+}
+
 fn set_timeouts(
     socket: &mut WebSocket<MaybeTlsStream<TcpStream>>,
 ) -> std::result::Result<(), String> {

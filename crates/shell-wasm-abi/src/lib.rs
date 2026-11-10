@@ -119,6 +119,21 @@ pub mod import {
     pub const OPEN_DIALOG: &str = "open_dialog";
     /// `fn()`: closes the topmost dialog.
     pub const CLOSE_DIALOG: &str = "close_dialog";
+    /// `fn(request_ptr: u32, request_len: u32, callback: u32) -> u32`: starts
+    /// a command the execute grant allows, from JSON `{"command", "args"}`,
+    /// and returns its resource id. `callback` receives each output line as
+    /// `{"stdout"}` / `{"stderr"}`, then `{"exit": {"code", "signal",
+    /// "error"}}`.
+    pub const PROCESS_SPAWN: &str = "process_spawn";
+    /// `fn(url_ptr: u32, url_len: u32, callback: u32) -> u32`: opens a
+    /// WebSocket the network grants allow and returns its resource id.
+    /// `callback` receives `{"open"}`, each `{"message"}`, then `{"close"}`
+    /// or `{"error"}`.
+    pub const SOCKET_OPEN: &str = "socket_open";
+    /// `fn(id: u32, text_ptr: u32, text_len: u32)`: sends a text message.
+    pub const SOCKET_SEND: &str = "socket_send";
+    /// `fn(id: u32)`: stops a resource — kills a process, closes a socket.
+    pub const RESOURCE_STOP: &str = "resource_stop";
     /// `fn(toast_ptr: u32, toast_len: u32)`: shows a toast described as JSON
     /// `{"title", "description", "level"}`.
     pub const PUSH_TOAST: &str = "push_toast";
