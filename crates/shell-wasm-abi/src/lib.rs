@@ -164,6 +164,13 @@ pub mod import {
     /// placement_ptr: u32, placement_len: u32)`: docks a part as a panel at
     /// `left`, `right`, `bottom` or `center`.
     pub const DOCK_ADD_PANEL: &str = "dock_add_panel";
+    /// `fn(dock: u64) -> u64`: the dock's current layout as JSON (where every
+    /// panel sits and how large each dock is) for the guest to keep.
+    pub const DOCK_DUMP: &str = "dock_dump";
+    /// `fn(dock: u64, layout_ptr: u32, layout_len: u32)`: restores a layout
+    /// `DOCK_DUMP` wrote, rebuilding each panel from the part docked under
+    /// its name. Panels must be added (under the same names) first.
+    pub const DOCK_LOAD: &str = "dock_load";
     /// `fn(toast_ptr: u32, toast_len: u32)`: shows a toast described as JSON
     /// `{"title", "description", "level"}`.
     pub const PUSH_TOAST: &str = "push_toast";

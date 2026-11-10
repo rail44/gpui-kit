@@ -244,6 +244,18 @@ impl Dock {
             )
         }
     }
+
+    /// The current layout, as JSON to keep (in `storage`, say) and hand back
+    /// to [`Dock::load`]: a script's `dock.dump()`.
+    pub fn dump(&self) -> String {
+        take_string(unsafe { host::dock_dump(self.0) })
+    }
+
+    /// Restores a layout [`Dock::dump`] wrote. Add the panels first, under
+    /// the names the layout was written with: a script's `dock.load(state)`.
+    pub fn load(&self, layout: &str) {
+        unsafe { host::dock_load(self.0, layout.as_ptr() as u32, layout.len() as u32) }
+    }
 }
 
 /// Draws a dock area.
@@ -984,6 +996,8 @@ mod host {
         pub fn open_sheet(part: u32, placement_ptr: u32, placement_len: u32);
         pub fn close_sheet();
         pub fn dock_new(id_ptr: u32, id_len: u32) -> u64;
+        pub fn dock_dump(dock: u64) -> u64;
+        pub fn dock_load(dock: u64, layout_ptr: u32, layout_len: u32);
         pub fn dock_add_panel(
             dock: u64,
             part: u32,
@@ -1068,6 +1082,12 @@ mod host {
     }
     pub unsafe fn close_sheet() {
         unimplemented!("gpui-shell host imports exist only in a wasm32 guest")
+    }
+    pub unsafe fn dock_dump(_: u64) -> u64 {
+        unreachable!()
+    }
+    pub unsafe fn dock_load(_: u64, _: u32, _: u32) {
+        unreachable!()
     }
     pub unsafe fn dock_new(_: u32, _: u32) -> u64 {
         unimplemented!("gpui-shell host imports exist only in a wasm32 guest")

@@ -30,7 +30,7 @@ gpui-fast = [
 default = ["quickjs", "components", "webview"]
 # Spike: WebAssembly guest views hosted by the QuickJS runtime
 # (`engine/quickjs/wasm_guest.rs`).
-wasm-guest = ["quickjs", "dep:wasmtime", "dep:gpui-shell-wasm-abi", "dep:postcard"]
+wasm-guest = ["quickjs", "components", "dep:wasmtime", "dep:gpui-shell-wasm-abi", "dep:postcard"]
 # The `gpui-component` catalog (`gpui_shell::components`), which scripts import
 # as `"gpui-component"`. Without it the runtime binds `gpui-base` only and does
 # not depend on the styled component library at all.

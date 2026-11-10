@@ -18,9 +18,11 @@
 //! registered components (validated against their schemas like a script's
 //! arguments) and their retained state (methods and input events), lazily
 //! rendered lists, and *parts* — render functions shown by views of their
-//! own, as nested child views, dialogs or dock panels; toasts; and, under the
-//! application's capabilities, the persistent and session stores, the
-//! clipboard, files, processes (run or streamed), HTTP and WebSockets.
+//! own, as nested child views, dialogs, sheets or dock panels (whose layout
+//! the guest can save and restore, under a tab strip the host draws); toasts;
+//! and, under the application's capabilities, the persistent and session
+//! stores, the clipboard, files, processes (run, streamed, or fed on stdin),
+//! HTTP and WebSockets (text and binary).
 //! Calls a script makes asynchronously are asynchronous here too,
 //! callback-style (a core module has no promise to settle): the work runs
 //! off the main thread and the handler back on it, once per event for a
@@ -34,8 +36,11 @@
 //!   guest *kind* next to scripts, not a second engine; removing QuickJS
 //!   would mean reimplementing `ShellRuntime`, which is what this approach
 //!   exists to reuse.
-//! * Not reached: process stdin, binary socket messages, dock layout
-//!   persistence and chrome (the dock is the bare skin), sheets.
+//! * Dock chrome is the host's fixed tab strip: a guest cannot draw its own
+//!   (a script's chrome handlers run in layout, which a guest would have to
+//!   describe per group). Panels persist their place but no payload of their
+//!   own: guest state is the guest's to keep. Panel names are global per
+//!   name, so two live instances of one guest share a registration.
 //! * Descriptions cross as postcard; handler payloads as JSON. The grid test
 //!   below times the guest beside the script.
 
@@ -848,14 +853,39 @@ fn open_pending_dialogs(ctx: &Ctx<'_>, runtime: &Rc<ShellRuntime>, guest: &Guest
         let area = runtime.entities().dock(panel.dock).ok_or_else(|| {
             js_error::type_error(ctx, "the dock area was released before its panel was added")
         })?;
-        let name = crate::dock::panel_name("wasm-guest", &panel.name);
+        // Registered under its name, so a restored layout rebuilds the panel
+        // from the same part.
+        let script: Rc<dyn crate::dock::PanelScript> = Rc::new(GuestPanel {
+            runtime: Rc::downgrade(runtime),
+            guest: guest_by_id(guest.id.get())
+                .as_ref()
+                .map(Rc::downgrade)
+                .unwrap_or_default(),
+            part: panel.part,
+            policy: scope::policy(),
+        });
         scope::with_current(move |window, cx| {
-            let panel = cx.new(|cx| crate::dock::ScriptPanel::new(name, view, cx));
+            let name = crate::dock::register_panel("wasm-guest", &panel.name, script.clone(), cx);
+            let panel =
+                cx.new(|cx| crate::dock::ScriptPanel::new(name, view, cx).with_script(script));
             area.update(cx, |area, cx| {
                 area.add_panel(panel, placement, None, window, cx)
             });
         })
         .ok_or_else(|| js_error::type_error(ctx, "adding a panel needs a live host call"))?;
+    }
+
+    // After the panels, so a layout restored in the same call finds them
+    // registered. Queued: rebuilding a panel makes a view, which waits for
+    // the boundary where the JavaScript context is unlocked.
+    let loads = std::mem::take(&mut *guest.pending_loads.borrow_mut());
+    for (dock, state) in loads {
+        runtime.queue_dock_edit(
+            ctx,
+            dock,
+            super::dock_api::DockEdit::Load(Box::new(state)),
+            "Dock::load",
+        )?;
     }
 
     let sheets = std::mem::take(&mut *guest.pending_sheets.borrow_mut());
@@ -901,6 +931,100 @@ fn open_pending_dialogs(ctx: &Ctx<'_>, runtime: &Rc<ShellRuntime>, guest: &Guest
     Ok(())
 }
 
+/// How a guest's panel is rebuilt when a saved layout is restored: the same
+/// part, drawn by a fresh view. A guest that is gone builds nothing, and the
+/// panel's place in the layout is carried forward.
+struct GuestPanel {
+    runtime: Weak<ShellRuntime>,
+    guest: Weak<Guest>,
+    part: u32,
+    policy: Rc<crate::policy::Policy>,
+}
+
+impl crate::dock::PanelScript for GuestPanel {
+    fn build(&self, window: &mut Window, cx: &mut App) -> Option<Entity<ScriptView>> {
+        let runtime = self.runtime.upgrade()?;
+        let guest = self.guest.upgrade()?;
+        let (_scope, _) = scope::enter_with_application(
+            &runtime,
+            window,
+            cx,
+            ScopePhase::Event,
+            None,
+            self.policy.clone(),
+            guest.application.clone(),
+        );
+        runtime
+            .with_js(|ctx| part_view(ctx, &runtime, &guest, self.part, None))
+            .map_err(|error| tracing::error!("a guest panel could not be rebuilt: {error}"))
+            .ok()
+    }
+}
+
+/// The chrome a guest's dock wears: a tab strip per group, one tab per panel
+/// titled with its name, a click showing that panel. Drawn by the host, so a
+/// guest gets working tabs without describing any.
+struct GuestTabs;
+
+impl crate::dock::DockChrome for GuestTabs {
+    fn tab_bar(
+        &self,
+        group: &gpui_base::dock::TabGroupContext,
+        _: &mut Window,
+        cx: &mut App,
+    ) -> gpui::AnyElement {
+        use gpui::{
+            InteractiveElement as _, IntoElement as _, ParentElement as _,
+            StatefulInteractiveElement as _, Styled as _, div,
+        };
+        use gpui_component::ActiveTheme as _;
+
+        let theme = cx.theme();
+        let (bar, active, foreground, active_foreground, border) = (
+            theme.tab_bar,
+            theme.tab_active,
+            theme.tab_foreground,
+            theme.tab_active_foreground,
+            theme.border,
+        );
+        let tabs: Vec<_> = group
+            .panels()
+            .iter()
+            .enumerate()
+            .filter(|(_, panel)| panel.visible(cx))
+            .map(|(ix, panel)| {
+                let name = panel.panel_name(cx);
+                let title = name.rsplit('/').next().unwrap_or(name).to_owned();
+                let selected = ix == group.active_ix();
+                let group = group.clone();
+                div()
+                    .id(("guest-tab", ix))
+                    .px_2()
+                    .py_1()
+                    .text_sm()
+                    .bg(if selected { active } else { bar })
+                    .text_color(if selected {
+                        active_foreground
+                    } else {
+                        foreground
+                    })
+                    .debug_selector(|| format!("guest-tab-{title}"))
+                    .child(title)
+                    .on_click(move |_, window, cx| group.select_tab(ix, window, cx))
+            })
+            .collect();
+        div()
+            .id("guest-tab-bar")
+            .flex()
+            .flex_row()
+            .bg(bar)
+            .border_b_1()
+            .border_color(border)
+            .children(tabs)
+            .into_any_element()
+    }
+}
+
 /// A panel a guest asked to dock.
 struct PendingPanel {
     dock: EntityHandle,
@@ -934,6 +1058,10 @@ struct Guest {
     pending_panels: RefCell<Vec<PendingPanel>>,
     /// Parts the guest asked to open as sheets, with their placement.
     pending_sheets: RefCell<Vec<(u32, String)>>,
+    /// The dock areas the guest created.
+    docks: RefCell<Vec<EntityHandle>>,
+    /// Layouts the guest asked to restore, by dock, not yet queued.
+    pending_loads: RefCell<Vec<(EntityHandle, gpui_base::dock::DockAreaState)>>,
     /// Processes and sockets the guest started, by the id it was handed.
     resources: RefCell<Vec<Option<Resource>>>,
 }
@@ -1016,6 +1144,8 @@ impl Guest {
             pending_dialogs: RefCell::new(Vec::new()),
             pending_panels: RefCell::new(Vec::new()),
             pending_sheets: RefCell::new(Vec::new()),
+            docks: RefCell::new(Vec::new()),
+            pending_loads: RefCell::new(Vec::new()),
             resources: RefCell::new(Vec::new()),
         });
         guest.store.borrow_mut().data_mut().guest = Rc::downgrade(&guest);
@@ -1864,18 +1994,22 @@ fn link_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 "Dock::new cannot run during render; create a dock in init or a handler"
             );
             let runtime = runtime_of(&caller)?;
-            scope::with_current(|window, cx| {
+            let handle = scope::with_current(|window, cx| {
                 runtime.entities().create_dock(
                     &id,
                     None,
-                    crate::dock::ScriptDockSkin::default(),
+                    crate::dock::ScriptDockSkin::new(Rc::new(GuestTabs)),
                     scope::current_application_generation(),
                     window,
                     cx,
                 )
             })
             .ok_or_else(|| anyhow!("Dock::new needs a live host call"))?
-            .map_err(|_| anyhow!("too many retained entities"))
+            .map_err(|_| anyhow!("too many retained entities"))?;
+            if let Some(guest) = caller.data().guest.upgrade() {
+                guest.docks.borrow_mut().push(handle);
+            }
+            Ok(handle.into())
         },
     )?;
     linker.func_wrap(
@@ -1902,6 +2036,44 @@ fn link_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 name,
                 placement,
             });
+            Ok(())
+        },
+    )?;
+    linker.func_wrap(
+        module,
+        abi::import::DOCK_DUMP,
+        |mut caller: Caller<'_, HostState>, dock: u64| -> Result<u64> {
+            let runtime = runtime_of(&caller)?;
+            let area = runtime
+                .entities()
+                .dock(EntityHandle::from(dock))
+                .ok_or_else(|| anyhow!("the dock area was released"))?;
+            let state = scope::with_current_app(|cx| area.read(cx).dump(cx))
+                .ok_or_else(|| anyhow!("Dock::dump needs a live host call"))?;
+            let layout = serde_json::to_string(&state)?;
+            write_string(&mut caller, &layout)
+        },
+    )?;
+    linker.func_wrap(
+        module,
+        abi::import::DOCK_LOAD,
+        |mut caller: Caller<'_, HostState>,
+         dock: u64,
+         layout_ptr: u32,
+         layout_len: u32|
+         -> Result<()> {
+            let layout = read_string(&mut caller, layout_ptr, layout_len)?;
+            let state: gpui_base::dock::DockAreaState =
+                serde_json::from_str(&layout).context("this is not a layout Dock::dump wrote")?;
+            let guest = caller
+                .data()
+                .guest
+                .upgrade()
+                .ok_or_else(|| anyhow!("the guest is gone"))?;
+            guest
+                .pending_loads
+                .borrow_mut()
+                .push((EntityHandle::from(dock), state));
             Ok(())
         },
     )?;
@@ -3245,9 +3417,36 @@ mod tests {
         let tree = app.tree();
         assert!(tree.contains("dock"), "{tree}");
 
-        // Both parts are panels in the dock, drawn by it.
+        // The host draws a tab per center panel; clicking one shows it.
+        let center_tab = |app: &mut Harness| {
+            let runtime = app.runtime.clone();
+            let dock = REGISTRY.with(|registry| {
+                registry
+                    .borrow()
+                    .guests
+                    .iter()
+                    .flatten()
+                    .find_map(|guest| guest.docks.borrow().first().copied())
+                    .expect("the guest created a dock")
+            });
+            let area = runtime.entities().dock(dock).expect("a live dock");
+            let state = app.context.update(|_, cx| area.read(cx).dump(cx));
+            serde_json::to_value(&state).unwrap()["center"]["children"][0]["info"]["tabs"]["active_index"]
+                .as_u64()
+        };
+        assert_eq!(center_tab(&mut app), Some(1), "the last added tab shows");
+        let editor_tab = app
+            .context
+            .debug_bounds("guest-tab-editor")
+            .expect("the host drew a tab for the editor panel");
+        app.context
+            .simulate_click(editor_tab.center(), gpui::Modifiers::none());
+        app.settle();
+        assert_eq!(center_tab(&mut app), Some(0));
+
+        // The parts are panels in the dock, drawn by it.
         let panels = part_views(&mut app.context, &app.view);
-        assert_eq!(panels.len(), 2, "{tree}");
+        assert_eq!(panels.len(), 3, "{tree}");
         let trees: Vec<String> = panels.iter().map(|panel| app.tree_of(panel)).collect();
         let files = panels[trees
             .iter()
@@ -3266,6 +3465,31 @@ mod tests {
         app.dispatch_click(open);
         let editor_tree = app.tree_of(&editor);
         assert!(editor_tree.contains("\"lib.rs\""), "{editor_tree}");
+
+        // A saved layout written while the editor showed, restored after the
+        // notes tab was picked again, shows the editor and rebuilds panels.
+        let save = app.handler_in(&files, "save-layout", "on_click");
+        app.dispatch_click(save);
+        let files_tree = app.tree_of(&files);
+        assert!(!files_tree.contains("Saved: 0"), "{files_tree}");
+        let notes_tab = app
+            .context
+            .debug_bounds("guest-tab-notes")
+            .expect("the host drew a tab for the notes panel");
+        app.context
+            .simulate_click(notes_tab.center(), gpui::Modifiers::none());
+        app.settle();
+        assert_eq!(center_tab(&mut app), Some(1));
+        let before = part_views(&mut app.context, &app.view).len();
+        let restore = app.handler_in(&files, "restore-layout", "on_click");
+        app.dispatch_click(restore);
+        app.settle();
+        assert_eq!(center_tab(&mut app), Some(0), "the saved tab shows again");
+        let after = part_views(&mut app.context, &app.view).len();
+        assert!(
+            after > before,
+            "restoring rebuilt the panels: {before} -> {after}"
+        );
     }
 
     #[gpui::test]
