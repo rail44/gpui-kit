@@ -532,7 +532,7 @@ fn bridged(args: &[Arg]) -> SmallVec<[Bridged; 2]> {
             Arg::Nil => Bridged::Nil,
             Arg::Bool(value) => Bridged::Bool(*value),
             Arg::Number(value) => Bridged::Number(*value),
-            Arg::Str(value) => Bridged::Str(value.clone()),
+            Arg::Str(value) => Bridged::Str(value.to_string()),
         })
         .collect()
 }

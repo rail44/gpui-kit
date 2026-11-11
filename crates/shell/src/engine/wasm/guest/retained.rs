@@ -5,7 +5,10 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use anyhow::{Result, anyhow, bail};
-use gpui_shell_wasm_abi::retained::{Batch, Kind, Mutation, Prop};
+use gpui_shell_wasm_abi::{
+    Name,
+    retained::{Batch, Kind, Mutation, Prop},
+};
 
 use super::{
     Guest, ShellRuntime, bridged, handler_name, intern, param_style, registered_method,
@@ -30,10 +33,10 @@ pub(in crate::engine::wasm) struct Tree {
 struct Node {
     kind: Kind,
     /// One prop per key, in the order the keys were first set.
-    props: Vec<(String, Prop)>,
+    props: Vec<(Name, Prop)>,
     children: Vec<u64>,
     parent: Option<u64>,
-    listeners: Vec<String>,
+    listeners: Vec<Name>,
 }
 
 impl Tree {

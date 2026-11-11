@@ -36,7 +36,7 @@ use sycamore_reactive::{RootHandle, create_root, map_keyed};
 pub use crate::{CArg, Event};
 use crate::{
     abi::{
-        self, Arg,
+        self, Arg, Name,
         retained::{Kind, Mutation, Prop, target},
     },
     host, plain_argument, take_string,
@@ -141,13 +141,13 @@ impl Node {
         match value.as_static() {
             Some(value) => emit(Mutation::SetProp {
                 id,
-                key,
+                key: key.into(),
                 value: Some(make(value.clone())),
             }),
             None => create_effect(move || {
                 emit(Mutation::SetProp {
                     id,
-                    key: key.clone(),
+                    key: key.clone().into(),
                     value: Some(make(value.get_clone())),
                 })
             }),
@@ -159,8 +159,8 @@ impl Node {
     pub fn style(self, name: &str) -> Self {
         emit(Mutation::SetProp {
             id: self.0,
-            key: name.to_owned(),
-            value: Some(Prop::Style(name.to_owned())),
+            key: Name::from(name.to_owned()),
+            value: Some(Prop::Style(Name::from(name.to_owned()))),
         });
         self
     }
@@ -168,14 +168,14 @@ impl Node {
     /// A style taking one number, in pixels.
     pub fn style_number(self, name: &'static str, value: impl Into<MaybeDyn<f64>>) -> Self {
         self.bind(name, value.into(), move |value| {
-            Prop::ParamStyle(name.to_owned(), vec![Arg::Number(value)])
+            Prop::ParamStyle(Name::from(name), vec![Arg::Number(value)])
         })
     }
 
     /// A style taking one string: a color token or `#rrggbb`, a family.
     pub fn style_str(self, name: &'static str, value: impl Into<Str>) -> Self {
         self.bind(name, value.into(), move |value| {
-            Prop::ParamStyle(name.to_owned(), vec![Arg::Str(value.into_owned())])
+            Prop::ParamStyle(Name::from(name), vec![Arg::Str(value)])
         })
     }
 
@@ -191,9 +191,9 @@ impl Node {
         create_effect(move || {
             emit(Mutation::SetProp {
                 id,
-                key: name.to_owned(),
+                key: Name::from(name.to_owned()),
                 value: value().map(|value| {
-                    Prop::ParamStyle(name.to_owned(), vec![Arg::Str(value.to_owned())])
+                    Prop::ParamStyle(Name::from(name), vec![Arg::Str(Name::from(value))])
                 }),
             })
         });
@@ -255,7 +255,7 @@ impl Node {
     /// A checkbox's state.
     pub fn checked(self, value: impl Into<MaybeDyn<bool>>) -> Self {
         self.bind("checked", value.into(), |value| {
-            Prop::Method("checked".to_owned(), vec![Arg::Bool(value)])
+            Prop::Method(Name::from("checked"), vec![Arg::Bool(value)])
         })
     }
 
@@ -263,9 +263,9 @@ impl Node {
     pub fn call(self, method: &str, args: impl IntoIterator<Item = CArg>) -> Self {
         emit(Mutation::SetProp {
             id: self.0,
-            key: method.to_owned(),
+            key: Name::from(method.to_owned()),
             value: Some(Prop::Component(
-                method.to_owned(),
+                Name::from(method.to_owned()),
                 args.into_iter().map(plain_argument).collect(),
             )),
         });
@@ -280,9 +280,9 @@ impl Node {
         create_effect(move || {
             emit(Mutation::SetProp {
                 id,
-                key: method.clone(),
+                key: method.clone().into(),
                 value: Some(Prop::Component(
-                    method.clone(),
+                    method.clone().into(),
                     args().into_iter().map(plain_argument).collect(),
                 )),
             })
@@ -294,9 +294,9 @@ impl Node {
     pub fn hover(self, styles: impl FnOnce(Styles) -> Styles) -> Self {
         emit(Mutation::SetProp {
             id: self.0,
-            key: "hover".to_owned(),
+            key: Name::from("hover"),
             value: Some(Prop::StateStyle(
-                "hover".to_owned(),
+                Name::from("hover"),
                 styles(Styles(Vec::new())).0,
             )),
         });
@@ -374,7 +374,7 @@ impl Node {
         });
         emit(Mutation::Listen {
             id: self.0,
-            event: event.to_owned(),
+            event: Name::from(event.to_owned()),
         });
         self
     }
@@ -395,16 +395,16 @@ pub struct Styles(Vec<Prop>);
 impl Styles {
     pub fn bg(mut self, color: &str) -> Self {
         self.0.push(Prop::ParamStyle(
-            "bg".to_owned(),
-            vec![Arg::Str(color.to_owned())],
+            Name::from("bg"),
+            vec![Arg::Str(Name::from(color.to_owned()))],
         ));
         self
     }
 
     pub fn text_color(mut self, color: &str) -> Self {
         self.0.push(Prop::ParamStyle(
-            "text_color".to_owned(),
-            vec![Arg::Str(color.to_owned())],
+            Name::from("text_color"),
+            vec![Arg::Str(Name::from(color.to_owned()))],
         ));
         self
     }

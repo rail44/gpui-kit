@@ -275,24 +275,29 @@ pub enum ComponentArg {
     Optional(Option<Box<ComponentArg>>),
 }
 
+/// The name of a style, method, event or prop key, or a string argument: a
+/// literal in the guest's code is kept as it is rather than copied, and a
+/// decoded one is owned.
+pub type Name = std::borrow::Cow<'static, str>;
+
 /// One call recorded on an element.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Op {
     /// A no-argument style method (`size_full`, `items_center`, ...).
-    Style(String),
+    Style(Name),
     /// A style method with arguments (`gap(8)`, `bg("primary")`, ...).
-    ParamStyle(String, Vec<Arg>),
+    ParamStyle(Name, Vec<Arg>),
     /// A behavior method (`checked(true)`, `disabled(false)`, ...).
-    Method(String, Vec<Arg>),
+    Method(Name, Vec<Arg>),
     /// An event handler (`on_click`, `on_change`) and the guest's callback id.
-    Callback(String, u32),
+    Callback(Name, u32),
     /// A method a registered component declares (`label`, `primary`,
     /// `value`, ...).
-    Component(String, Vec<ComponentArg>),
+    Component(Name, Vec<ComponentArg>),
     /// A state style (`hover`, `active`, `focus`): the styles recorded on a
     /// detached node, by its index, applied while the element is in that
     /// state.
-    StateStyle(String, u32),
+    StateStyle(Name, u32),
     /// A named element slot (`content`, `trigger`, `header`, ...): the node
     /// at the index is rendered by the component in a place of its own.
     Slot(String, u32),
@@ -304,7 +309,7 @@ pub enum Arg {
     Nil,
     Bool(bool),
     Number(f64),
-    Str(String),
+    Str(Name),
 }
 
 /// The retained protocol (`docs/wasm-retained-guest.md`): the guest builds its
@@ -315,7 +320,7 @@ pub enum Arg {
 pub mod retained {
     use serde::{Deserialize, Serialize};
 
-    use super::{Arg, ComponentArg};
+    use super::{Arg, ComponentArg, Name};
 
     /// What a node is. Fixed for the node's life: a registered component
     /// whose constructor arguments change is recreated.
@@ -344,15 +349,15 @@ pub mod retained {
     #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
     pub enum Prop {
         /// A no-argument style (`size_full`, `items_center`, ...).
-        Style(String),
+        Style(Name),
         /// A style with arguments (`gap(8)`, `bg("primary")`, ...).
-        ParamStyle(String, Vec<Arg>),
+        ParamStyle(Name, Vec<Arg>),
         /// A behavior method (`checked(true)`, ...).
-        Method(String, Vec<Arg>),
+        Method(Name, Vec<Arg>),
         /// A method a registered component declares (`label`, `value`, ...).
-        Component(String, Vec<ComponentArg>),
+        Component(Name, Vec<ComponentArg>),
         /// Styles applied while the node is in a state (`hover`, ...).
-        StateStyle(String, Vec<Prop>),
+        StateStyle(Name, Vec<Prop>),
     }
 
     /// One operation on the host's tree. Node ids are the guest's, counted
@@ -366,7 +371,7 @@ pub mod retained {
         /// `None` removes the prop under `key`.
         SetProp {
             id: u64,
-            key: String,
+            key: Name,
             value: Option<Prop>,
         },
         SetText {
@@ -391,11 +396,11 @@ pub mod retained {
         /// The node has a handler for `event` (`on_click`, `on_change`).
         Listen {
             id: u64,
-            event: String,
+            event: Name,
         },
         Unlisten {
             id: u64,
-            event: String,
+            event: Name,
         },
         /// Makes `id` the root of `part` (0 is the guest's own view).
         SetRoot {

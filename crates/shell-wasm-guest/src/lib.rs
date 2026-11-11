@@ -29,7 +29,7 @@
 
 use std::rc::Rc;
 
-use abi::{Arg, Component, ComponentArg, Description, Node, Op};
+use abi::{Arg, Component, ComponentArg, Description, Name, Node, Op};
 pub use gpui_shell_wasm_abi as abi;
 use serde_json::Value;
 
@@ -285,7 +285,7 @@ enum Kind {
 
 enum PendingOp {
     Op(Op),
-    Component(String, Vec<CArg>),
+    Component(Name, Vec<CArg>),
     StateStyle(&'static str, Element),
     Slot(String, Element),
 }
@@ -486,15 +486,19 @@ pub fn input(state: &InputState) -> Element {
 
 impl Element {
     /// A no-argument style method by name (`"size_full"`, `"items_center"`).
-    pub fn style(mut self, name: &str) -> Self {
-        self.ops.push(PendingOp::Op(Op::Style(name.to_owned())));
+    pub fn style(mut self, name: impl Into<Name>) -> Self {
+        self.ops.push(PendingOp::Op(Op::Style(name.into())));
         self
     }
 
     /// A style method with arguments by name (`"gap"`, `"bg"`).
-    pub fn style_with(mut self, name: &str, args: impl IntoIterator<Item = Arg>) -> Self {
+    pub fn style_with(
+        mut self,
+        name: impl Into<Name>,
+        args: impl IntoIterator<Item = Arg>,
+    ) -> Self {
         self.ops.push(PendingOp::Op(Op::ParamStyle(
-            name.to_owned(),
+            name.into(),
             args.into_iter().collect(),
         )));
         self
@@ -530,20 +534,20 @@ impl Element {
 
     /// A method the registered component declares (`label`, `primary`,
     /// `value`): `.call("label", ["Add".into()])`.
-    pub fn call(mut self, name: &str, args: impl IntoIterator<Item = CArg>) -> Self {
+    pub fn call(mut self, name: impl Into<Name>, args: impl IntoIterator<Item = CArg>) -> Self {
         self.ops.push(PendingOp::Component(
-            name.to_owned(),
+            name.into(),
             args.into_iter().collect(),
         ));
         self
     }
 
-    fn number(self, name: &str, value: f64) -> Self {
+    fn number(self, name: &'static str, value: f64) -> Self {
         self.style_with(name, [Arg::Number(value)])
     }
 
-    fn string(self, name: &str, value: &str) -> Self {
-        self.style_with(name, [Arg::Str(value.to_owned())])
+    fn string(self, name: &'static str, value: impl Into<Name>) -> Self {
+        self.style_with(name, [Arg::Str(value.into())])
     }
 
     pub fn size_full(self) -> Self {
@@ -589,20 +593,20 @@ impl Element {
         self.number("border", px)
     }
     /// A semantic color token (`"background"`, `"primary"`) or `#rrggbb`.
-    pub fn bg(self, color: &str) -> Self {
+    pub fn bg(self, color: impl Into<Name>) -> Self {
         self.string("bg", color)
     }
-    pub fn text_color(self, color: &str) -> Self {
+    pub fn text_color(self, color: impl Into<Name>) -> Self {
         self.string("text_color", color)
     }
-    pub fn border_color(self, color: &str) -> Self {
+    pub fn border_color(self, color: impl Into<Name>) -> Self {
         self.string("border_color", color)
     }
 
     /// A behavior method by name (`"checked"`, `"disabled"`).
-    pub fn method(mut self, name: &str, args: impl IntoIterator<Item = Arg>) -> Self {
+    pub fn method(mut self, name: impl Into<Name>, args: impl IntoIterator<Item = Arg>) -> Self {
         self.ops.push(PendingOp::Op(Op::Method(
-            name.to_owned(),
+            name.into(),
             args.into_iter().collect(),
         )));
         self
@@ -613,7 +617,7 @@ impl Element {
 
     pub fn on_click(mut self, handler: Handler) -> Self {
         self.ops.push(PendingOp::Op(Op::Callback(
-            "on_click".to_owned(),
+            Name::from("on_click"),
             handler.0,
         )));
         self
@@ -621,7 +625,7 @@ impl Element {
     /// A checkbox's toggle; the [`Event`] carries the requested state.
     pub fn on_change(mut self, handler: Handler) -> Self {
         self.ops.push(PendingOp::Op(Op::Callback(
-            "on_change".to_owned(),
+            Name::from("on_change"),
             handler.0,
         )));
         self
@@ -685,7 +689,7 @@ impl Element {
                         args.into_iter().map(|arg| argument(arg, nodes)).collect(),
                     ),
                     PendingOp::StateStyle(name, styles) => {
-                        Op::StateStyle(name.to_owned(), flatten(styles, nodes))
+                        Op::StateStyle(Name::from(name), flatten(styles, nodes))
                     }
                     PendingOp::Slot(name, element) => Op::Slot(name, flatten(element, nodes)),
                 })
@@ -1222,16 +1226,16 @@ impl<V: View> Guest<V> {
 
     /// Renders the view (`part` 0) or one of its parts.
     pub fn render(&mut self, part: u32) -> u64 {
-        let Some(description) = self.describe(part) else {
+        let Some(element) = self.element(part) else {
             return abi::pack(0, 0);
         };
-        self.last = postcard::to_allocvec(&description).unwrap_or_default();
+        self.last = postcard::to_allocvec(&element.into_description()).unwrap_or_default();
         abi::pack(self.last.as_ptr() as u32, self.last.len() as u32)
     }
 
     /// Builds the view (`part` 0) or one of its parts, registering this
     /// render's handlers.
-    fn describe(&mut self, part: u32) -> Option<Description> {
+    fn element(&mut self, part: u32) -> Option<Element> {
         let view = self.view.as_mut().expect("render before init");
         let renderer = match part {
             0 => None,
@@ -1246,7 +1250,7 @@ impl<V: View> Guest<V> {
             Some(renderer) => renderer(view, &mut self.cx),
         };
         self.cx.rendering = None;
-        Some(element.into_description())
+        Some(element)
     }
 
     /// Initializes the view and returns its first batch, for the retained
@@ -1259,8 +1263,8 @@ impl<V: View> Guest<V> {
     /// Renders the view, compares it with the last render and returns the
     /// operations between them.
     fn retained_render(&mut self) -> u64 {
-        if let Some(description) = self.describe(0) {
-            self.differ.update(&description);
+        if let Some(element) = self.element(0) {
+            self.differ.update(element);
         }
         let batch = self.differ.take();
         diffed::pack(&batch, &mut self.last)

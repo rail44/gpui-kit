@@ -219,21 +219,34 @@ difference over the same protocol (`gpui-shell-wasm-guest`'s `diffed`). It
 passes the same todo test, and its tree is identical to the other two.
 
 Timed side by side (`scripts/compare-engines.sh`, five alternating release
-runs, load average about 4.6; best / median, ms, 100 rows):
+runs, load average about 4.7; best / median, ms, 100 rows):
 
 | | QuickJS | wasm, reactive | wasm, GPUI style |
 |---|---|---|---|
-| describe | 0.935 / 1.022 | 0.248 / 0.253 | 0.168 / 0.254 |
-| filter click | 0.005 / 0.006 | 0.016 / 0.016 | 0.570 / 0.797 |
-| one row toggled | 0.005 / 0.005 | 0.088 / 0.088 | 0.559 / 0.794 |
-| materialize | 0.789 / 0.797 | 1.064 / 1.102 | 0.771 / 1.076 |
+| describe | 0.896 / 0.928 | 0.163 / 0.241 | 0.162 / 0.179 |
+| filter click | 0.005 / 0.005 | 0.011 / 0.016 | 0.276 / 0.293 |
+| one row toggled | 0.005 / 0.005 | 0.059 / 0.087 | 0.276 / 0.293 |
+| materialize | 0.746 / 0.759 | 0.763 / 1.054 | 0.756 / 0.762 |
 
 An event's own cost is not the whole of it: QuickJS defers its render to
-the next describe, while both retained guests do their work in the event
-and leave the host only a copy. Per toggled row, then, QuickJS spends
-about 1.0 ms (0.005 + 1.022), the reactive guest about 0.34 ms, and the
-GPUI-style guest 0.8 to 1.0 ms: the full render and the diff happen in the
-guest on every notify, as a GPUI view's render does on the host.
+the next describe and does no comparison at all, while both retained
+guests do their work in the event and leave the host only a copy. Per
+toggled row, then, QuickJS spends about 0.93 ms (0.005 + 0.928), the
+reactive guest about 0.33 ms, and the GPUI-style guest about 0.47 ms: it
+renders the whole view again on every notify, as a GPUI view does on the
+host, and then compares it with the last.
+
+The GPUI-style figures are after two changes to the comparison, which
+first cost 0.56 to 0.79 ms per event (measured natively, render 151 µs,
+flattening 51 µs, comparison 320 µs, encoding 0.3 µs, for a 25-byte batch).
+The guest now compares the render's element tree directly, moving its
+values instead of flattening and copying them, compares props in order
+first, and touches the handler table only where a callback moved; and a
+style, method or event name, or a string argument, is an
+`abi::Name` (`Cow<'static, str>`), so a literal in the view's code is never
+copied. The next step is GPUI's own one: child views that render again
+only when notified, which the script engine already has (`cx.new(Class)`,
+`cx.notify(entity)`).
 
 Simplified or not yet done:
 
