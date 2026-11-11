@@ -134,6 +134,8 @@ pub use component_registry::{
     MethodDescriptor, RegistryError, StateDescriptor, StateMethodDescriptor,
 };
 pub(crate) use component_registry::{ComponentCallbackValue, ComponentId, RecordedComponentMethod};
+#[cfg(feature = "wasm-engine")]
+pub use engine::{HostCall, HostFunction, HostVal};
 pub use engine::{LoadedApplication, ShellRuntime};
 pub use error::ShellError;
 #[cfg(not(feature = "gpui-fast"))]

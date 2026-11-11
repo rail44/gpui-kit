@@ -531,7 +531,7 @@ impl Differ {
         let id = old.id;
         let (kind, props, listeners, children) = parts(element);
         if old.kind != kind {
-            if let Kind::Text(text) = &kind {
+            if let Kind::Text(text) | Kind::TextView { text, .. } = &kind {
                 self.batch.push(Mutation::SetText {
                     id,
                     text: text.clone(),
@@ -659,6 +659,14 @@ fn same_kind(old: &Kind, element: &Element) -> bool {
         | (Kind::Checkbox(old), ElementKind::Base(Component::Checkbox(new))) => old == new,
         (Kind::Input(old), ElementKind::Base(Component::Input(new))) => old == new,
         (
+            Kind::TextView { id, markdown, .. },
+            ElementKind::Base(Component::TextView {
+                id: new_id,
+                markdown: new_markdown,
+                ..
+            }),
+        ) => id == new_id && markdown == new_markdown,
+        (
             Kind::Registered { export, args },
             ElementKind::Registered {
                 export: new_export,
@@ -705,6 +713,7 @@ fn parts(element: Element) -> Parts {
             Component::Button(id) => Kind::Button(id),
             Component::Checkbox(id) => Kind::Checkbox(id),
             Component::Input(handle) => Kind::Input(handle),
+            Component::TextView { id, markdown, text } => Kind::TextView { id, markdown, text },
             other => panic!("a retained view written as a GPUI view cannot draw {other:?} yet"),
         },
         ElementKind::Registered { export, args } => Kind::Registered {

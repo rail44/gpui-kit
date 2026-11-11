@@ -1,0 +1,23 @@
+[package]
+name = "wasm-document"
+description = "Spike: a Markdown document viewer as a WASI preview 2 component guest."
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Built for `wasm32-wasip2` on its own; see examples/wasm_todolist.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+gpui-shell-wasm-guest = { path = "../../crates/shell-wasm-guest" }
+# For the embedding host's own interface, which this guest imports beside
+# gpui-shell's.
+wit-bindgen = "0.63"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true

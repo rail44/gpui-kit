@@ -312,6 +312,13 @@ impl Capabilities {
         &self.env_variables
     }
 
+    /// The directories the application may read, and those it may also
+    /// write: what a WASI guest's preopened directories are built from.
+    #[cfg_attr(not(feature = "wasm-engine"), allow(dead_code))]
+    pub(crate) fn roots(&self) -> (&[PathBuf], &[PathBuf]) {
+        (&self.read_roots, &self.write_roots)
+    }
+
     pub fn may_exit(&self) -> bool {
         self.exit
     }

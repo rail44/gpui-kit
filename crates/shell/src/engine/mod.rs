@@ -158,6 +158,9 @@ pub use active::{LoadedApplication, ShellRuntime, ViewObject};
 /// generation, or by the policy it ran under. Above the seam, because a view,
 /// a root and a plugin host each own one of those boundaries.
 pub(crate) use active::{cancel_application_tasks, cancel_policy_tasks, cancel_view_tasks};
+/// What an embedding host offers guests of its own, beyond this runtime's.
+#[cfg(feature = "wasm-engine")]
+pub use wasm::{HostCall, HostFunction, HostVal};
 
 /// Points the script-visible store at its backing file.
 ///

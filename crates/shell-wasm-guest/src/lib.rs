@@ -80,6 +80,24 @@ pub(crate) mod sys {
         }
     }
 
+    /// Focus handles are in the component world only.
+    pub fn focus_new() -> u64 {
+        #[cfg(target_env = "p2")]
+        return component::focus_new();
+        #[cfg(not(target_env = "p2"))]
+        unimplemented!("focus handles need a guest built as a component (wasm32-wasip2)")
+    }
+
+    pub fn focus(handle: u64) {
+        #[cfg(target_env = "p2")]
+        return component::focus(handle);
+        #[cfg(not(target_env = "p2"))]
+        {
+            let _ = handle;
+            unimplemented!("focus handles need a guest built as a component (wasm32-wasip2)")
+        }
+    }
+
     pub fn input_on_submit(handle: u32, callback: u32) {
         #[cfg(target_env = "p2")]
         return component::input_on_submit(handle, callback);
@@ -92,10 +110,10 @@ pub(crate) mod sys {
 
 pub mod prelude {
     pub use crate::{
-        CArg, ComponentState, Cx, Data, Dock, Element, Event, Handler, InputState, Part,
-        ToastLevel, View, button, checkbox, component,
+        CArg, ComponentState, Cx, Data, Dock, Element, Event, FocusHandle, Handler, InputState,
+        Part, ToastLevel, View, button, checkbox, component,
         diffed::{Child, Render},
-        div, dock, export_view, h_flex, input, nested, text, v_flex,
+        div, dock, export_view, h_flex, input, nested, text, text_view, v_flex,
     };
 }
 
@@ -710,6 +728,40 @@ impl Element {
         self
     }
 
+    /// A handler for the event `name`: an element's (`on_key_down`, ...), or
+    /// on a registered component the name of a method taking a callback.
+    pub fn on(mut self, name: impl Into<Name>, handler: Handler) -> Self {
+        self.ops
+            .push(PendingOp::Op(Op::Callback(name.into(), handler.0)));
+        self
+    }
+
+    /// A key pressed while the element has focus. The event carries `key`
+    /// and `modifiers`.
+    pub fn on_key_down(self, handler: Handler) -> Self {
+        self.on("on_key_down", handler)
+    }
+
+    /// A link clicked in a [`text_view`]; the event is the link's target.
+    pub fn on_link_click(self, handler: Handler) -> Self {
+        self.on("on_link_click", handler)
+    }
+
+    /// Makes the element the one `handle` focuses.
+    pub fn track_focus(self, handle: &FocusHandle) -> Self {
+        self.method("track_focus", [Arg::Number(handle.0 as f64)])
+    }
+
+    /// The element's id, which a scrolling element needs to keep its place.
+    pub fn id(self, id: impl Into<Name>) -> Self {
+        self.method("id", [Arg::Str(id.into())])
+    }
+
+    /// Lets the element scroll its content vertically. Needs an [`Self::id`].
+    pub fn overflow_y_scroll(self) -> Self {
+        self.method("overflow_y_scroll", [])
+    }
+
     pub fn child(mut self, child: impl Into<Element>) -> Self {
         self.children.push(child.into());
         self
@@ -800,6 +852,34 @@ fn items(elements: Vec<Element>) -> abi::Items {
         .map(|element| element.flatten_into(&mut nodes))
         .collect();
     abi::Items { roots, nodes }
+}
+
+/// A Markdown document. A link in it reports to
+/// [`Element::on_link_click`] when that is set, and opens otherwise.
+pub fn text_view(id: impl Into<String>, markdown: impl Into<String>) -> Element {
+    element(Component::TextView {
+        id: id.into(),
+        markdown: true,
+        text: markdown.into(),
+    })
+}
+
+/// A focus handle, as GPUI's: an element that tracks it
+/// ([`Element::track_focus`]) takes key events while it is focused. Make it
+/// in `init` or a handler and keep it in the view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FocusHandle(u64);
+
+impl FocusHandle {
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> Self {
+        Self(sys::focus_new())
+    }
+
+    /// Moves keyboard focus to the element tracking this handle.
+    pub fn focus(&self) {
+        sys::focus(self.0)
+    }
 }
 
 /// A retained text input, owned by the host.

@@ -284,11 +284,51 @@ fn param_style(name: &str, args: &[Arg]) -> Result<SpecOp> {
 }
 
 fn handler_name(name: &str) -> Result<&'static str> {
-    Ok(match name {
+    element_handler(name).ok_or_else(|| anyhow!("unsupported handler `{name}`"))
+}
+
+/// An element's own events, as against a registered component's callbacks.
+fn element_handler(name: &str) -> Option<&'static str> {
+    Some(match name {
         "on_click" => "on_click",
         "on_change" => "on_change",
-        other => anyhow::bail!("unsupported handler `{other}`"),
+        "on_key_down" => "on_key_down",
+        "on_key_up" => "on_key_up",
+        "on_link_click" => "on_link_click",
+        _ => return None,
     })
+}
+
+/// A document, under the policy of the application describing it.
+fn text_view(id: &str, markdown: bool, text: &str) -> Component {
+    Component::TextView(crate::spec::TextViewSpec {
+        id: id.to_owned().into(),
+        text: text.to_owned().into(),
+        format: if markdown {
+            crate::spec::TextViewFormat::Markdown
+        } else {
+            crate::spec::TextViewFormat::Html
+        },
+        policy: scope::policy(),
+    })
+}
+
+/// A registered component's callback method `name` on node `id`, calling
+/// `callback`.
+fn registered_callback(
+    runtime: &ShellRuntime,
+    id: SpecId,
+    name: &str,
+    callback: crate::spec::CallbackId,
+) -> Result<SpecOp> {
+    let method = registered_method_descriptor(runtime, id, name)
+        .ok_or_else(|| anyhow!("unsupported handler `{name}`"))?;
+    let payload = method
+        .record(&[crate::ComponentArgument::Callback(callback)])
+        .map_err(|error| anyhow!("{name}(...): {error}"))?;
+    Ok(SpecOp::RegisteredMethod(
+        crate::RecordedComponentMethod::new(method.name(), payload),
+    ))
 }
 
 fn state_style_name(name: &str) -> Result<&'static str> {
@@ -519,6 +559,7 @@ fn component(component: &abi::Component) -> Component {
         abi::Component::Button(id) => Component::Button(id.clone()),
         abi::Component::Checkbox(id) => Component::Checkbox(id.clone()),
         abi::Component::Input(handle) => Component::Input(EntityHandle::from(*handle)),
+        abi::Component::TextView { id, markdown, text } => text_view(id, *markdown, text),
         abi::Component::Registered { .. }
         | abi::Component::Nested(_)
         | abi::Component::Dock(_)
@@ -1006,13 +1047,39 @@ impl wasmtime_wasi::WasiView for HostState {
     }
 }
 
+/// What a component sees of the machine through WASI: standard output, and
+/// the directories the application's file grants name, under the paths they
+/// have on the host, read-only unless the grant is to write.
+fn wasi_context() -> wasmtime_wasi::WasiCtx {
+    use wasmtime_wasi::{DirPerms, FilePerms};
+    let mut builder = wasmtime_wasi::WasiCtxBuilder::new();
+    builder.inherit_stdio();
+    let policy = scope::policy();
+    let (read, write) = policy.capabilities().roots();
+    let grants = write
+        .iter()
+        .map(|root| (root, DirPerms::all(), FilePerms::all()))
+        .chain(
+            read.iter()
+                .filter(|root| !write.contains(root))
+                .map(|root| (root, DirPerms::READ, FilePerms::READ)),
+        );
+    for (root, dir, file) in grants {
+        // A grant for a directory that is not there grants nothing.
+        if let Err(error) = builder.preopened_dir(root, root.to_string_lossy(), dir, file) {
+            tracing::debug!("{} is not opened for the guest: {error:#}", root.display());
+        }
+    }
+    builder.build()
+}
+
 impl HostState {
     fn new(runtime: &Rc<ShellRuntime>) -> Self {
         Self {
             runtime: Rc::downgrade(runtime),
             guest: Weak::new(),
             view: None,
-            wasi: wasmtime_wasi::WasiCtxBuilder::new().inherit_stdio().build(),
+            wasi: wasi_context(),
             table: wasmtime_wasi::ResourceTable::new(),
         }
     }
@@ -1033,6 +1100,19 @@ impl Guest {
                 let mut linker = wasmtime::component::Linker::new(engine);
                 wasmtime_wasi::p2::add_to_linker_sync(&mut linker)?;
                 link_component_imports(&mut linker)?;
+                // What the embedding host offers beyond this runtime's own.
+                for (interface, functions) in runtime.host_interfaces.borrow().iter() {
+                    let mut instance = linker.instance(interface)?;
+                    for (name, function) in functions {
+                        let function = function.clone();
+                        instance.func_new(name, move |store, arguments, results| {
+                            let call = super::HostCall {
+                                view: store.data().view.clone(),
+                            };
+                            function(&call, arguments, results)
+                        })?;
+                    }
+                }
                 let mut store = Store::new(engine, HostState::new(runtime));
                 let instance = linker
                     .instantiate(&mut store, component)
@@ -1271,7 +1351,7 @@ impl Guest {
     }
 
     /// [`Self::dispatch_native`] with a JSON payload for the handler.
-    fn dispatch_native_with(
+    pub(super) fn dispatch_native_with(
         self: &Rc<Self>,
         callback: u32,
         payload: &Json,
@@ -1817,6 +1897,39 @@ fn input_on_submit(state: &HostState, handle: u32, callback: u32) -> Result<()> 
 fn link_component_imports(linker: &mut wasmtime::component::Linker<HostState>) -> Result<()> {
     use wasmtime::StoreContextMut;
     let mut host = linker.instance("gpui-shell:guest/host@0.1.0")?;
+    host.func_wrap(
+        "focus-new",
+        |store: StoreContextMut<'_, HostState>, (): ()| {
+            anyhow::ensure!(
+                !matches!(
+                    scope::current_phase(),
+                    Some(ScopePhase::Render | ScopePhase::Layout)
+                ),
+                "a focus handle is made in init or a handler, not during render"
+            );
+            let runtime = runtime_in(store.data())?;
+            let handle = scope::with_current_app(|cx| {
+                runtime
+                    .entities()
+                    .create_focus(scope::current_application_generation(), cx)
+            })
+            .ok_or_else(|| anyhow!("focus-new needs a live host call"))?
+            .map_err(|_| anyhow!("too many retained entities"))?;
+            Ok((handle,))
+        },
+    )?;
+    host.func_wrap(
+        "focus",
+        |store: StoreContextMut<'_, HostState>, (handle,): (u64,)| {
+            let runtime = runtime_in(store.data())?;
+            let focus = runtime
+                .entities()
+                .focus(handle)
+                .ok_or_else(|| anyhow!("focus handle {handle} is not live"))?;
+            scope::with_current(|window, cx| focus.focus(window, cx))
+                .ok_or_else(|| anyhow!("focus needs a live host call"))
+        },
+    )?;
     host.func_wrap(
         "input-new",
         |store: StoreContextMut<'_, HostState>, (placeholder,): (String,)| {
@@ -3185,6 +3298,103 @@ mod tests {
             runtime.build_snapshot(&object, None, crate::policy::default(), window, cx)
         })?;
         Ok(snapshot.debug_tree())
+    }
+
+    /// A document viewer built as a component: it reads its file through
+    /// WASI inside the granted directory, calls functions the embedding host
+    /// registered, follows a clicked link and goes back on a key.
+    #[gpui::test]
+    fn a_component_reads_files_calls_its_host_and_hears_links_and_keys(cx: &mut TestAppContext) {
+        let documents = std::env::temp_dir().join(format!(
+            "gpui-shell-documents-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&documents).unwrap();
+        let documents = documents.canonicalize().unwrap();
+        std::fs::write(documents.join("a.md"), "# First\n\nSee [the next](b.md).\n").unwrap();
+        std::fs::write(documents.join("b.md"), "# Second\n").unwrap();
+        let directory = application_for("wasm_document", "wasm32-wasip2");
+
+        cx.update(crate::init);
+        crate::set_capabilities(crate::Capabilities::new().read_roots([documents.clone()]));
+        let runtime = ShellRuntime::new_isolated().expect("runtime");
+        cx.update(|cx| runtime.set_global(cx));
+        // The embedding host's own interface, beside gpui-shell's.
+        let first = documents.join("a.md").to_string_lossy().into_owned();
+        runtime.add_host_function(
+            "example:document/host@0.1.0",
+            "initial",
+            move |_, _, results| {
+                results[0] = crate::HostVal::String(first.clone());
+                Ok(())
+            },
+        );
+        let opened = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = opened.clone();
+        runtime.add_host_function(
+            "example:document/host@0.1.0",
+            "opened",
+            move |_, arguments, _| {
+                if let Some(crate::HostVal::String(path)) = arguments.first() {
+                    log.lock().unwrap().push(path.clone());
+                }
+                Ok(())
+            },
+        );
+
+        let window = cx.add_window(|_, _| gpui::Empty);
+        let mut context = VisualTestContext::from_window(*window.deref(), cx);
+        let view_type = runtime.load_app(&directory, "guest.wasm").expect("load");
+        let view = context
+            .update(|window, cx| runtime.instantiate_view(&view_type, window, cx))
+            .expect("instantiate");
+        let tree = drawn_tree(&mut context, &view);
+        assert!(tree.contains("# First"), "{tree}");
+        assert!(tree.contains("(0 back)"), "{tree}");
+
+        let callback = |context: &mut VisualTestContext, event: &'static str| {
+            let view = view.clone();
+            context.update(|_, cx| {
+                let view = view.read(cx);
+                let arena = view.snapshot().expect("a snapshot").arena();
+                (0..arena.len())
+                    .filter_map(|id| arena.node(id as SpecId))
+                    .find_map(|node| {
+                        node.ops().iter().find_map(|op| match op {
+                            SpecOp::Callback(name, callback) if *name == event => Some(*callback),
+                            _ => None,
+                        })
+                    })
+                    .expect("the handler")
+            })
+        };
+
+        // A link in the document: the guest follows it in place.
+        let link = callback(&mut context, "on_link_click");
+        context.update(|window, cx| {
+            runtime.dispatch_host_event(link, crate::HostValue::from("b.md"), window, cx)
+        });
+        let tree = drawn_tree(&mut context, &view);
+        assert!(tree.contains("# Second"), "{tree}");
+        assert!(tree.contains("(1 back)"), "{tree}");
+
+        // Backspace while focused: back to the first.
+        let key = callback(&mut context, "on_key_down");
+        let backspace = gpui::Keystroke::parse("backspace").unwrap();
+        context.update(|window, cx| runtime.dispatch_key(key, &backspace, None, window, cx));
+        let tree = drawn_tree(&mut context, &view);
+        assert!(tree.contains("# First"), "{tree}");
+
+        let opened = opened.lock().unwrap().clone();
+        let names: Vec<_> = opened
+            .iter()
+            .map(|path| path.rsplit('/').next().unwrap_or_default().to_owned())
+            .collect();
+        assert_eq!(names, ["a.md", "b.md", "a.md"]);
     }
 
     /// What the shipped command's `check` does: load through the manifest,

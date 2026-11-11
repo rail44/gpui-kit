@@ -290,8 +290,28 @@ todo list with child rows, built as a component, passes the same test, and
 in the comparison a toggled row costs the same as the core module
 (0.022 / 0.032 ms against 0.023 / 0.032 ms; three runs).
 
-So far the world carries only what that example needs: the input
-functions. Everything else the SDK offers a core module (storage, HTTP,
+`examples/wasm_document` is the shape of a view an embedding application
+hands to an extension, and what the test of it covers:
+
+- **Files through WASI.** The directories the application's file grants
+  name are preopened under their host paths, read-only unless the grant is
+  to write, and the guest reads with `std::fs`.
+- **The embedding host's own functions.** `ShellRuntime::add_host_function`
+  offers a function under a WIT interface of the host's own, which a guest
+  imports beside gpui-shell's (its crate generates the imports from its own
+  WIT). The function is told which view is calling, and
+  `ShellRuntime::deliver` hands a guest an event for a callback it passed.
+- **More events.** `Listen` now takes an element's `on_key_down`,
+  `on_key_up` and `on_link_click`, and on a registered component the name of
+  any method that takes a callback. A `TextView` kind draws Markdown, a
+  focus handle (`focus-new`, `focus`) lets an element take keys, and `id`
+  and `overflow_y_scroll` make one scroll.
+
+Not exercised by a test yet: a registered component's callback through
+`Listen`, and `deliver`.
+
+The world itself carries only the input and focus functions. Everything
+else the SDK offers a core module (storage, HTTP,
 processes, sockets, parts, docks) is not in the world yet and traps in a
 component; the reactive SDK's exports are not built for components yet;
 and a component's WASI context grants nothing but standard output until

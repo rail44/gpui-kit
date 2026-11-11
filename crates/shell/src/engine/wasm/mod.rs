@@ -46,6 +46,28 @@ use crate::{
 
 pub(crate) use guest::Guest;
 
+/// A value crossing a host function's boundary, as the component model
+/// types it.
+pub use wasmtime::component::Val as HostVal;
+
+/// A function an embedding host offers its guests, beyond this runtime's
+/// own: it reads its arguments and writes its results in place.
+pub type HostFunction =
+    std::sync::Arc<dyn Fn(&HostCall, &[HostVal], &mut [HostVal]) -> Result<()> + Send + Sync>;
+
+/// Who is calling a [`HostFunction`].
+pub struct HostCall {
+    view: Option<WeakEntity<ScriptView>>,
+}
+
+impl HostCall {
+    /// The calling guest's own view, by which a host knows which of its
+    /// places (a pane, a panel) the call is about.
+    pub fn view(&self) -> Option<Entity<ScriptView>> {
+        self.view.as_ref()?.upgrade()
+    }
+}
+
 /// A compiled application module, ready to instantiate.
 #[derive(Clone)]
 pub struct ViewType {
@@ -148,6 +170,9 @@ pub struct ShellRuntime {
     /// Every live guest, so an application generation's release reaches the
     /// processes and sockets its guests started.
     guests: RefCell<Vec<Rc<Guest>>>,
+    /// What the embedding host offers guests: by WIT interface name, each
+    /// function's name and body.
+    host_interfaces: RefCell<HashMap<String, Vec<(String, HostFunction)>>>,
     metrics: Metrics,
     engine: wasmtime::Engine,
     next_application_generation: Cell<u64>,
@@ -244,10 +269,45 @@ impl ShellRuntime {
             arena: RefCell::new(SpecArena::new()),
             entities: RefCell::new(entities),
             guests: RefCell::new(Vec::new()),
+            host_interfaces: RefCell::new(HashMap::new()),
             metrics: Metrics::default(),
             engine: wasmtime::Engine::default(),
             next_application_generation: Cell::new(1),
         }))
+    }
+
+    /// Offers guests built as components a function of the embedding host's
+    /// own, as `name` of the WIT interface `interface` (a full name with its
+    /// version, such as `my:app/api@0.1.0`). It runs on the main thread,
+    /// inside the host call the guest made it from, so
+    /// [`crate::with_current_app`] reaches the application there. Guests
+    /// instantiated before the call do not see it.
+    pub fn add_host_function(
+        &self,
+        interface: &str,
+        name: &str,
+        function: impl Fn(&HostCall, &[HostVal], &mut [HostVal]) -> Result<()> + Send + Sync + 'static,
+    ) {
+        self.host_interfaces
+            .borrow_mut()
+            .entry(interface.to_owned())
+            .or_default()
+            .push((name.to_owned(), std::sync::Arc::new(function)));
+    }
+
+    /// Hands the guest drawn by `view` an event for a handler it registered
+    /// through a host function: `callback` is the number it passed, and
+    /// `payload` what its handler receives.
+    pub fn deliver(
+        self: &Rc<Self>,
+        view: &Entity<ScriptView>,
+        callback: u32,
+        payload: &Json,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let guest = view.read(cx).object().guest.clone();
+        guest.dispatch_native_with(callback, payload, window, cx);
     }
 
     pub fn component_registry(&self) -> &FrozenComponentRegistry {

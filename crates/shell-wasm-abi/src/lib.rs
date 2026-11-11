@@ -232,6 +232,13 @@ pub enum Component {
     Checkbox(String),
     /// A retained input, by the handle `input_new` returned.
     Input(u32),
+    /// A document: Markdown, or HTML when `markdown` is false. Its links
+    /// report to `on_link_click` instead of opening when it has a handler.
+    TextView {
+        id: String,
+        markdown: bool,
+        text: String,
+    },
     /// A part of the guest drawn in place by a view of its own (a script's
     /// child view), by the part number the guest registered.
     Nested(u32),
@@ -336,6 +343,13 @@ pub mod retained {
         Checkbox(String),
         /// A retained input, by the handle `input_new` returned.
         Input(u32),
+        /// A document: Markdown, or HTML when `markdown` is false. `SetText`
+        /// replaces its text.
+        TextView {
+            id: String,
+            markdown: bool,
+            text: String,
+        },
         /// A component the host's catalog registered, by its constructor's
         /// export name.
         Registered {
@@ -393,7 +407,10 @@ pub mod retained {
         Dispose {
             id: u64,
         },
-        /// The node has a handler for `event` (`on_click`, `on_change`).
+        /// The node has a handler for `event`: an element's (`on_click`,
+        /// `on_change`, `on_key_down`, `on_key_up`, `on_link_click`), or on
+        /// a registered component the name of a method that takes a
+        /// callback.
         Listen {
             id: u64,
             event: Name,

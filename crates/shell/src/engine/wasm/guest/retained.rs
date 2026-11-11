@@ -11,8 +11,8 @@ use gpui_shell_wasm_abi::{
 };
 
 use super::{
-    Guest, ShellRuntime, bridged, handler_name, intern, param_style, registered_method,
-    registered_node, state_style_name,
+    Guest, ShellRuntime, bridged, element_handler, intern, param_style, registered_callback,
+    registered_method, registered_node, state_style_name, text_view,
 };
 use crate::{
     entities::EntityHandle,
@@ -103,7 +103,7 @@ impl Tree {
             }
             Mutation::SetText { id, text } => {
                 match &mut self.node(id)?.kind {
-                    Kind::Text(value) => *value = text,
+                    Kind::Text(value) | Kind::TextView { text: value, .. } => *value = text,
                     _ => bail!("node {id} is not text"),
                 }
                 touched.push(id);
@@ -230,6 +230,7 @@ fn record_node(
             Kind::Button(id) => Component::Button(id.clone()),
             Kind::Checkbox(id) => Component::Checkbox(id.clone()),
             Kind::Input(handle) => Component::Input(EntityHandle::from(*handle)),
+            Kind::TextView { id, markdown, text } => text_view(id, *markdown, text),
             Kind::Registered { .. } => unreachable!("matched above"),
         }),
     };
@@ -241,11 +242,18 @@ fn record_node(
             .map_err(|error| anyhow!("{error}"))?;
     }
     for event in &node.listeners {
-        let name = handler_name(event)?;
-        let callback = runtime.register_node(guest, id, name);
+        // An element's own event, or a registered component's method that
+        // takes a callback.
+        let op = match element_handler(event) {
+            Some(name) => SpecOp::Callback(name, runtime.register_node(guest, id, name)),
+            None => {
+                let callback = runtime.register_node(guest, id, intern(event));
+                registered_callback(runtime, spec, event, callback)?
+            }
+        };
         runtime
             .arena_mut()
-            .push_op(spec, SpecOp::Callback(name, callback))
+            .push_op(spec, op)
             .map_err(|error| anyhow!("{error}"))?;
     }
     for &child in &node.children {

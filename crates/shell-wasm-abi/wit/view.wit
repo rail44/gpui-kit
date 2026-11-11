@@ -16,6 +16,12 @@ interface host {
     /// Delivers Enter in the input as a `handler` event addressed to
     /// `callback`.
     input-on-submit: func(handle: u32, callback: u32);
+
+    /// Creates a focus handle, for an element to track (`track_focus`) so
+    /// it can take key events. From `init` or a handler.
+    focus-new: func() -> u64;
+    /// Moves keyboard focus to the element tracking `handle`.
+    focus: func(handle: u64);
 }
 
 world view {
