@@ -175,14 +175,19 @@ fn on_click(node: &crate::spec::SpecNode) -> Option<CallbackId> {
     })
 }
 
-/// Writes the tree this engine described and prints the line the script
-/// collects.
-fn report(case: &str, snapshot: &crate::RenderSnapshot, figures: &[(&str, Duration)]) {
+/// Writes the tree `engine` described and prints the line the script
+/// collects. `engine` names the build, or a guest variant within it.
+fn report(
+    engine: &str,
+    case: &str,
+    snapshot: &crate::RenderSnapshot,
+    figures: &[(&str, Duration)],
+) {
     let directory =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/engine-comparison");
     std::fs::create_dir_all(&directory).unwrap();
     std::fs::write(
-        directory.join(format!("{case}.{ENGINE}.tree")),
+        directory.join(format!("{case}.{engine}.tree")),
         snapshot.debug_tree(),
     )
     .unwrap();
@@ -191,7 +196,7 @@ fn report(case: &str, snapshot: &crate::RenderSnapshot, figures: &[(&str, Durati
         .map(|(name, duration)| format!("{name}={:.3}", duration.as_secs_f64() * 1000.0))
         .collect();
     println!(
-        "[engine-comparison] engine={ENGINE} case={case} nodes={} {} (ms)",
+        "[engine-comparison] engine={engine} case={case} nodes={} {} (ms)",
         snapshot.len(),
         figures.join(" ")
     );
@@ -204,6 +209,7 @@ fn the_grid_is_timed(cx: &mut TestAppContext) {
     let describe = app.describe();
     let materialize = app.materialize(&snapshot);
     report(
+        ENGINE,
         "grid-40x5",
         &snapshot,
         &[("describe", describe), ("materialize", materialize)],
@@ -212,7 +218,20 @@ fn the_grid_is_timed(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn the_todo_list_is_timed(cx: &mut TestAppContext) {
-    let mut app = load(cx, "wasm_todolist");
+    time_todo(cx, "wasm_todolist", ENGINE);
+}
+
+/// The same todo list written as a GPUI view is (a `render` after every
+/// notify), diffed in the guest over the retained protocol, next to the
+/// reactive one.
+#[cfg(feature = "wasm-engine")]
+#[gpui::test]
+fn the_todo_list_written_as_a_gpui_view_is_timed(cx: &mut TestAppContext) {
+    time_todo(cx, "wasm_todolist_render", "wasm-render");
+}
+
+fn time_todo(cx: &mut TestAppContext, example_name: &str, engine: &str) {
+    let mut app = load(cx, example_name);
 
     // Rows go in the way a person adds them: type, then press Add.
     for row in 0..TODO_ROWS {
@@ -243,7 +262,29 @@ fn the_todo_list_is_timed(cx: &mut TestAppContext) {
         "{tree}"
     );
     let describe = app.describe();
-    // A handler that changes state and asks for a render: the filter.
+    // A handler that changes one row, the summary and the progress: one
+    // row's checkbox, ticked and cleared in turn.
+    let toggle = find(&snapshot, |node| match node.component()? {
+        Component::Checkbox(id) if id == "done-1" => node.ops().iter().find_map(|op| match op {
+            SpecOp::Callback("on_change", callback) => Some(*callback),
+            _ => None,
+        }),
+        _ => None,
+    })
+    .expect("the first row's checkbox");
+    let toggled = {
+        let runtime = app.runtime.clone();
+        let mut checked = false;
+        app.context.update(|window, cx| {
+            best_per_call(|| {
+                checked = !checked;
+                runtime.dispatch_change(toggle, checked, window, cx)
+            })
+        })
+    };
+    // A handler that changes state and asks for a render: the filter. Timed
+    // after the toggle, because under `Active` a ticked row leaves the list,
+    // and its handler with it.
     let filter = find(&snapshot, |node| match node.component()? {
         Component::Button(id) if id == "filter-Active" => on_click(node),
         _ => None,
@@ -257,11 +298,13 @@ fn the_todo_list_is_timed(cx: &mut TestAppContext) {
     };
     let materialize = app.materialize(&snapshot);
     report(
+        engine,
         &format!("todo-{TODO_ROWS}"),
         &snapshot,
         &[
             ("describe", describe),
             ("event", event),
+            ("toggle", toggled),
             ("materialize", materialize),
         ],
     );

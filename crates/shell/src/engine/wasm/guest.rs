@@ -2706,7 +2706,17 @@ mod tests {
 
     #[gpui::test]
     fn the_todo_guest_renders_adds_toggles_submits_and_removes(cx: &mut TestAppContext) {
-        let mut app = Harness::load(cx);
+        todo_flow(Harness::load(cx));
+    }
+
+    /// The same flow for the todo list written as a GPUI view, diffed in the
+    /// guest over the retained protocol.
+    #[gpui::test]
+    fn the_todo_guest_written_as_a_gpui_view_does_the_same(cx: &mut TestAppContext) {
+        todo_flow(Harness::load_example(cx, "wasm_todolist_render"));
+    }
+
+    fn todo_flow(mut app: Harness) {
         let tree = app.tree();
         assert!(tree.contains("Nothing yet"), "{tree}");
         // Registered `gpui-component` components, with their methods recorded

@@ -33,6 +33,7 @@ use abi::{Arg, Component, ComponentArg, Description, Node, Op};
 pub use gpui_shell_wasm_abi as abi;
 use serde_json::Value;
 
+pub mod diffed;
 pub mod reactive;
 
 pub mod prelude {
@@ -1193,6 +1194,8 @@ pub struct Guest<V: View> {
     /// The last render's encoded description, kept until the next render so
     /// the pointer handed to the host stays valid while it reads.
     last: Vec<u8>,
+    /// The last render, for a view exported over the retained protocol.
+    differ: diffed::Differ,
     /// The same for the last item range and the last item key, which the
     /// host asks for during layout, between renders.
     last_items: Vec<u8>,
@@ -1205,6 +1208,7 @@ impl<V: View> Default for Guest<V> {
             view: None,
             cx: Cx::new(),
             last: Vec::new(),
+            differ: diffed::Differ::default(),
             last_items: Vec::new(),
             last_key: Vec::new(),
         }
@@ -1218,13 +1222,20 @@ impl<V: View> Guest<V> {
 
     /// Renders the view (`part` 0) or one of its parts.
     pub fn render(&mut self, part: u32) -> u64 {
+        let Some(description) = self.describe(part) else {
+            return abi::pack(0, 0);
+        };
+        self.last = postcard::to_allocvec(&description).unwrap_or_default();
+        abi::pack(self.last.as_ptr() as u32, self.last.len() as u32)
+    }
+
+    /// Builds the view (`part` 0) or one of its parts, registering this
+    /// render's handlers.
+    fn describe(&mut self, part: u32) -> Option<Description> {
         let view = self.view.as_mut().expect("render before init");
         let renderer = match part {
             0 => None,
-            part => match self.cx.parts.get(part as usize - 1) {
-                Some(renderer) => Some(renderer.clone()),
-                None => return abi::pack(0, 0),
-            },
+            part => Some(self.cx.parts.get(part as usize - 1)?.clone()),
         };
         self.cx.per_render[part as usize].clear();
         self.cx.item_renderers[part as usize].clear();
@@ -1235,8 +1246,50 @@ impl<V: View> Guest<V> {
             Some(renderer) => renderer(view, &mut self.cx),
         };
         self.cx.rendering = None;
-        self.last = postcard::to_allocvec(&element.into_description()).unwrap_or_default();
-        abi::pack(self.last.as_ptr() as u32, self.last.len() as u32)
+        Some(element.into_description())
+    }
+
+    /// Initializes the view and returns its first batch, for the retained
+    /// protocol.
+    pub fn retained_init(&mut self) -> u64 {
+        self.init();
+        self.retained_render()
+    }
+
+    /// Renders the view, compares it with the last render and returns the
+    /// operations between them.
+    fn retained_render(&mut self) -> u64 {
+        if let Some(description) = self.describe(0) {
+            self.differ.update(&description);
+        }
+        let batch = self.differ.take();
+        diffed::pack(&batch, &mut self.last)
+    }
+
+    /// Runs the handler an event is addressed to, renders again if it
+    /// notified, and returns the batch.
+    pub fn retained_event(
+        &mut self,
+        kind: u32,
+        target: u64,
+        name: Vec<u8>,
+        payload: Vec<u8>,
+    ) -> u64 {
+        let callback = match kind {
+            abi::retained::target::NODE => {
+                let name = String::from_utf8(name).unwrap_or_default();
+                self.differ.handler(target, &name)
+            }
+            abi::retained::target::HANDLER => Some(target as u32),
+            _ => None,
+        };
+        let notify = callback.is_some_and(|callback| self.dispatch(callback, payload) != 0);
+        if notify {
+            self.retained_render()
+        } else {
+            let batch = self.differ.take();
+            diffed::pack(&batch, &mut self.last)
+        }
     }
 
     /// Describes items `start..end` of a list, during the host's layout. The
@@ -1340,6 +1393,62 @@ macro_rules! export_view {
                 ::std::vec::Vec::from_raw_parts(ptr as *mut u8, len as usize, len as usize)
             };
             GUEST.with(|guest| guest.borrow_mut().dispatch(callback, payload))
+        }
+    };
+}
+
+/// Generates the retained protocol's exports for a view written as a GPUI
+/// view is ([`View`]): each render after a notify is compared with the last,
+/// and only the difference crosses ([`diffed`]).
+#[macro_export]
+macro_rules! export_view_retained {
+    ($view:ty) => {
+        thread_local! {
+            static GUEST: ::std::cell::RefCell<$crate::Guest<$view>> =
+                ::std::cell::RefCell::new($crate::Guest::default());
+        }
+
+        #[unsafe(no_mangle)]
+        pub extern "C" fn gpui_shell_alloc(len: u32) -> u32 {
+            let mut buffer = ::std::vec::Vec::<u8>::with_capacity(len as usize);
+            let ptr = buffer.as_mut_ptr();
+            ::std::mem::forget(buffer);
+            ptr as u32
+        }
+
+        #[unsafe(no_mangle)]
+        pub extern "C" fn gpui_retained_init() -> u64 {
+            GUEST.with(|guest| guest.borrow_mut().retained_init())
+        }
+
+        #[unsafe(no_mangle)]
+        pub extern "C" fn gpui_retained_event(
+            kind: u32,
+            target: u64,
+            name_ptr: u32,
+            name_len: u32,
+            payload_ptr: u32,
+            payload_len: u32,
+        ) -> u64 {
+            let (name, payload) = unsafe {
+                (
+                    ::std::vec::Vec::from_raw_parts(
+                        name_ptr as *mut u8,
+                        name_len as usize,
+                        name_len as usize,
+                    ),
+                    ::std::vec::Vec::from_raw_parts(
+                        payload_ptr as *mut u8,
+                        payload_len as usize,
+                        payload_len as usize,
+                    ),
+                )
+            };
+            GUEST.with(|guest| {
+                guest
+                    .borrow_mut()
+                    .retained_event(kind, target, name, payload)
+            })
         }
     };
 }

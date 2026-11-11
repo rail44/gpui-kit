@@ -32,13 +32,17 @@ for ((i = 1; i <= runs; i++)); do
     run wasm-engine
 done
 
+# Every other build or guest variant against the script's tree.
 for tree in "$out"/*.quickjs.tree; do
     case=$(basename "$tree" .quickjs.tree)
-    if ! cmp -s "$tree" "$out/$case.wasm.tree"; then
-        echo "the engines described different trees for $case:" >&2
-        diff "$tree" "$out/$case.wasm.tree" | head -20 >&2
-        exit 1
-    fi
+    for other in "$out/$case".*.tree; do
+        [ "$other" = "$tree" ] && continue
+        if ! cmp -s "$tree" "$other"; then
+            echo "$(basename "$other") differs from the script's tree:" >&2
+            diff "$tree" "$other" | head -20 >&2
+            exit 1
+        fi
+    done
 done
 
 echo "load average while timing: $(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null || uptime)"
@@ -47,7 +51,7 @@ awk '
     engine = ""; case_ = ""; nodes = ""
     for (i = 2; i <= NF; i++) {
         split($i, kv, "=")
-        if (kv[1] == "engine") engine = kv[2]
+        if (kv[1] == "engine") { engine = kv[2]; seen[engine] = 1 }
         else if (kv[1] == "case") case_ = kv[2]
         else if (kv[1] == "nodes") nodes = kv[2]
         else if (kv[2] != "") {
@@ -67,12 +71,22 @@ function stats(key, engine,    n, i, j, t, a) {
         for (j = i - 1; j >= 1 && a[j] > t; j--) a[j + 1] = a[j]
         a[j + 1] = t
     }
+    if (n == 0) return sprintf("%17s", "-")
     return sprintf("%7.3f / %7.3f", a[1], a[int((n + 1) / 2)])
 }
 END {
-    printf "%-12s %-12s %6s   %-19s   %-19s\n", "case", "metric", "nodes", "quickjs best/median", "wasm best/median"
+    # quickjs, then wasm, then the wasm guest variants
+    columns = 0
+    if ("quickjs" in seen) order[++columns] = "quickjs"
+    if ("wasm" in seen) order[++columns] = "wasm"
+    for (engine in seen) if (engine != "quickjs" && engine != "wasm") order[++columns] = engine
+    header = sprintf("%-12s %-12s %6s", "case", "metric", "nodes")
+    for (c = 1; c <= columns; c++) header = header sprintf("   %-17s", order[c])
+    print header "   (best / median, ms)"
     for (key in metrics) {
         split(key, parts, SUBSEP)
-        printf "%-12s %-12s %6s   %-19s   %-19s  ms\n", parts[1], parts[2], size[parts[1]], stats(key, "quickjs"), stats(key, "wasm")
+        row = sprintf("%-12s %-12s %6s", parts[1], parts[2], size[parts[1]])
+        for (c = 1; c <= columns; c++) row = row "   " stats(key, order[c])
+        print row
     }
 }' "$lines" | sort

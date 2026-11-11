@@ -209,6 +209,32 @@ tree is identical to the script twin's. A filter click costs 0.011 to
 batch's encoding and its application now happen in the event rather than
 in the next render.
 
+### The same view written as a GPUI view is
+
+`examples/wasm_todolist_render` is the todo list written as a GPUI view
+(a struct whose `render` runs again after every notify), with the same view
+code it had before the reactive rewrite. `export_view_retained!` has the
+guest compare each render with the last, by position, and send only the
+difference over the same protocol (`gpui-shell-wasm-guest`'s `diffed`). It
+passes the same todo test, and its tree is identical to the other two.
+
+Timed side by side (`scripts/compare-engines.sh`, five alternating release
+runs, load average about 4.6; best / median, ms, 100 rows):
+
+| | QuickJS | wasm, reactive | wasm, GPUI style |
+|---|---|---|---|
+| describe | 0.935 / 1.022 | 0.248 / 0.253 | 0.168 / 0.254 |
+| filter click | 0.005 / 0.006 | 0.016 / 0.016 | 0.570 / 0.797 |
+| one row toggled | 0.005 / 0.005 | 0.088 / 0.088 | 0.559 / 0.794 |
+| materialize | 0.789 / 0.797 | 1.064 / 1.102 | 0.771 / 1.076 |
+
+An event's own cost is not the whole of it: QuickJS defers its render to
+the next describe, while both retained guests do their work in the event
+and leave the host only a copy. Per toggled row, then, QuickJS spends
+about 1.0 ms (0.005 + 1.022), the reactive guest about 0.34 ms, and the
+GPUI-style guest 0.8 to 1.0 ms: the full render and the diff happen in the
+guest on every notify, as a GPUI view's render does on the host.
+
 Simplified or not yet done:
 
 - Events from retained state and resources arrive as `HANDLER` events
