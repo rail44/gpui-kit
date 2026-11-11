@@ -36,6 +36,60 @@ use serde_json::Value;
 pub mod diffed;
 pub mod reactive;
 
+/// The component boundary, generated from the WIT world. Present when the
+/// guest is built for `wasm32-wasip2`.
+#[cfg(target_env = "p2")]
+#[doc(hidden)]
+pub mod bindings {
+    wit_bindgen::generate!({
+        path: "../shell-wasm-abi/wit",
+        world: "view",
+        pub_export_macro: true,
+        export_macro_name: "export_component",
+    });
+}
+
+/// The host calls both kinds of guest make, each over its own boundary: the
+/// WIT world's imports in a component, raw imports in a core module.
+pub(crate) mod sys {
+    #[cfg(target_env = "p2")]
+    use crate::bindings::gpui_shell::guest::host as component;
+
+    pub fn input_new(placeholder: &str) -> u32 {
+        #[cfg(target_env = "p2")]
+        return component::input_new(placeholder);
+        #[cfg(not(target_env = "p2"))]
+        unsafe {
+            crate::host::input_new(placeholder.as_ptr() as u32, placeholder.len() as u32)
+        }
+    }
+
+    pub fn input_value(handle: u32) -> String {
+        #[cfg(target_env = "p2")]
+        return component::input_value(handle);
+        #[cfg(not(target_env = "p2"))]
+        crate::take_string(unsafe { crate::host::input_value(handle) })
+    }
+
+    pub fn input_set_value(handle: u32, value: &str) {
+        #[cfg(target_env = "p2")]
+        return component::input_set_value(handle, value);
+        #[cfg(not(target_env = "p2"))]
+        unsafe {
+            crate::host::input_set_value(handle, value.as_ptr() as u32, value.len() as u32)
+        }
+    }
+
+    pub fn input_on_submit(handle: u32, callback: u32) {
+        #[cfg(target_env = "p2")]
+        return component::input_on_submit(handle, callback);
+        #[cfg(not(target_env = "p2"))]
+        unsafe {
+            crate::host::input_on_submit(handle, callback)
+        }
+    }
+}
+
 pub mod prelude {
     pub use crate::{
         CArg, ComponentState, Cx, Data, Dock, Element, Event, Handler, InputState, Part,
@@ -754,15 +808,15 @@ pub struct InputState(u32);
 
 impl InputState {
     pub fn new(placeholder: &str) -> Self {
-        Self(unsafe { host::input_new(placeholder.as_ptr() as u32, placeholder.len() as u32) })
+        Self(crate::sys::input_new(placeholder))
     }
 
     pub fn value(&self) -> String {
-        take_string(unsafe { host::input_value(self.0) })
+        crate::sys::input_value(self.0)
     }
 
     pub fn set_value(&self, value: &str) {
-        unsafe { host::input_set_value(self.0, value.as_ptr() as u32, value.len() as u32) }
+        crate::sys::input_set_value(self.0, value)
     }
 
     /// Runs `f` when Enter is pressed in this input.
@@ -772,7 +826,7 @@ impl InputState {
         f: impl Fn(&mut V, &Event, &mut Cx<V>) + 'static,
     ) {
         let handler = cx.listener(f);
-        unsafe { host::input_on_submit(self.0, handler.0) }
+        crate::sys::input_on_submit(self.0, handler.0)
     }
 }
 
@@ -1017,7 +1071,7 @@ pub fn log(line: &str) {
     unsafe { host::log(line.as_ptr() as u32, line.len() as u32) }
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", not(target_env = "p2")))]
 mod host {
     #[link(wasm_import_module = "gpui_shell")]
     unsafe extern "C" {
@@ -1090,8 +1144,11 @@ mod host {
 }
 
 /// Native builds (for the SDK's own tests) have no host to call.
-#[cfg(not(target_arch = "wasm32"))]
+// A component reaches the host through the WIT world instead; what the
+// world does not carry yet traps here.
+#[cfg(any(not(target_arch = "wasm32"), target_env = "p2"))]
 #[allow(clippy::missing_safety_doc)]
+#[cfg_attr(target_env = "p2", allow(dead_code))]
 mod host {
     pub unsafe fn input_new(_: u32, _: u32) -> u32 {
         unimplemented!("gpui-shell host imports exist only in a wasm32 guest")
@@ -1284,19 +1341,31 @@ impl<V: View> Guest<V> {
     /// Initializes the view and returns its first batch, for the retained
     /// protocol.
     pub fn retained_init(&mut self) -> u64 {
+        let batch = self.retained_init_bytes();
+        self.keep(batch)
+    }
+
+    /// [`Self::retained_init`] for a component, which returns the bytes.
+    pub fn retained_init_bytes(&mut self) -> Vec<u8> {
         self.init();
         self.retained_render(true)
     }
 
+    /// Keeps a batch alive until the next and returns it packed, for a core
+    /// module's host to read out of the guest's memory.
+    fn keep(&mut self, batch: Vec<u8>) -> u64 {
+        self.last = batch;
+        abi::pack(self.last.as_ptr() as u32, self.last.len() as u32)
+    }
+
     /// Renders the view if `root` asks for it, then every child view that
     /// notified, and returns the operations that came of it.
-    fn retained_render(&mut self, root: bool) -> u64 {
+    fn retained_render(&mut self, root: bool) -> Vec<u8> {
         if root && let Some(element) = self.element(0) {
             self.differ.update(element);
         }
         self.differ.refresh_children();
-        let batch = self.differ.take();
-        diffed::pack(&batch, &mut self.last)
+        postcard::to_allocvec(&self.differ.take()).expect("a batch encodes")
     }
 
     /// Hands what child views emitted to the view's subscriptions, until
@@ -1336,6 +1405,18 @@ impl<V: View> Guest<V> {
         name: Vec<u8>,
         payload: Vec<u8>,
     ) -> u64 {
+        let batch = self.retained_event_bytes(kind, target, name, payload);
+        self.keep(batch)
+    }
+
+    /// [`Self::retained_event`] for a component, which returns the bytes.
+    pub fn retained_event_bytes(
+        &mut self,
+        kind: u32,
+        target: u64,
+        name: Vec<u8>,
+        payload: Vec<u8>,
+    ) -> Vec<u8> {
         let handler = match kind {
             abi::retained::target::NODE => {
                 let name = String::from_utf8(name).unwrap_or_default();
@@ -1464,6 +1545,36 @@ macro_rules! export_view_retained {
                 ::std::cell::RefCell::new($crate::Guest::default());
         }
 
+        #[cfg(target_env = "p2")]
+        struct GuestComponent;
+
+        #[cfg(target_env = "p2")]
+        impl $crate::bindings::Guest for GuestComponent {
+            fn init() -> ::std::vec::Vec<u8> {
+                GUEST.with(|guest| guest.borrow_mut().retained_init_bytes())
+            }
+
+            fn event(
+                kind: u32,
+                target: u64,
+                name: ::std::string::String,
+                payload: ::std::string::String,
+            ) -> ::std::vec::Vec<u8> {
+                GUEST.with(|guest| {
+                    guest.borrow_mut().retained_event_bytes(
+                        kind,
+                        target,
+                        name.into_bytes(),
+                        payload.into_bytes(),
+                    )
+                })
+            }
+        }
+
+        #[cfg(target_env = "p2")]
+        $crate::bindings::export_component!(GuestComponent with_types_in $crate::bindings);
+
+        #[cfg(not(target_env = "p2"))]
         #[unsafe(no_mangle)]
         pub extern "C" fn gpui_shell_alloc(len: u32) -> u32 {
             let mut buffer = ::std::vec::Vec::<u8>::with_capacity(len as usize);
@@ -1472,11 +1583,13 @@ macro_rules! export_view_retained {
             ptr as u32
         }
 
+        #[cfg(not(target_env = "p2"))]
         #[unsafe(no_mangle)]
         pub extern "C" fn gpui_retained_init() -> u64 {
             GUEST.with(|guest| guest.borrow_mut().retained_init())
         }
 
+        #[cfg(not(target_env = "p2"))]
         #[unsafe(no_mangle)]
         pub extern "C" fn gpui_retained_event(
             kind: u32,

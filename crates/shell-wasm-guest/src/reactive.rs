@@ -39,7 +39,7 @@ use crate::{
         self, Arg, Name,
         retained::{Kind, Mutation, Prop, target},
     },
-    host, plain_argument, take_string,
+    plain_argument,
 };
 
 /// A string a prop or text takes: fixed, or a closure read again whenever
@@ -432,21 +432,21 @@ pub struct InputState(u32);
 
 impl InputState {
     pub fn new(placeholder: &str) -> Self {
-        Self(unsafe { host::input_new(placeholder.as_ptr() as u32, placeholder.len() as u32) })
+        Self(crate::sys::input_new(placeholder))
     }
 
     pub fn value(&self) -> String {
-        take_string(unsafe { host::input_value(self.0) })
+        crate::sys::input_value(self.0)
     }
 
     pub fn set_value(&self, value: &str) {
-        unsafe { host::input_set_value(self.0, value.as_ptr() as u32, value.len() as u32) }
+        crate::sys::input_set_value(self.0, value)
     }
 
     /// Enter in the input.
     pub fn on_submit(&self, handler: impl FnMut(&Event) + 'static) {
         let token = register_token(handler);
-        unsafe { host::input_on_submit(self.0, token) }
+        crate::sys::input_on_submit(self.0, token)
     }
 }
 

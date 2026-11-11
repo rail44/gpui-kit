@@ -736,16 +736,14 @@ pub(super) fn handle(
     payload: &Json,
 ) -> Result<()> {
     let payload = payload.to_string();
-    match (&guest.protocol, target) {
-        (Protocol::Describe { .. }, HandlerTarget::Callback(handler)) => {
+    let retained = guest.tree().is_some();
+    match target {
+        HandlerTarget::Callback(handler) if !retained => {
             if guest.dispatch(*handler, payload.as_bytes())? {
                 refresh_guest(guest, None);
             }
         }
-        (Protocol::Retained { .. }, HandlerTarget::Node(id, event)) => {
-            guest.retained_event(retained_target::NODE, *id, event, payload.as_bytes())?;
-        }
-        (Protocol::Retained { .. }, HandlerTarget::Callback(token)) => {
+        HandlerTarget::Callback(token) => {
             guest.retained_event(
                 retained_target::HANDLER,
                 u64::from(*token),
@@ -753,7 +751,10 @@ pub(super) fn handle(
                 payload.as_bytes(),
             )?;
         }
-        (Protocol::Describe { .. }, HandlerTarget::Node(..)) => {
+        HandlerTarget::Node(id, event) if retained => {
+            guest.retained_event(retained_target::NODE, *id, event, payload.as_bytes())?;
+        }
+        HandlerTarget::Node(..) => {
             anyhow::bail!("a node handler for a guest that describes its view")
         }
     }
@@ -763,12 +764,12 @@ pub(super) fn handle(
 /// Builds `part`'s description into the runtime's scratch arena: by running
 /// a description guest's render, or by copying a retained guest's tree.
 pub(super) fn describe(runtime: &Rc<ShellRuntime>, guest: &Rc<Guest>, part: u32) -> Result<SpecId> {
-    match &guest.protocol {
-        Protocol::Describe { .. } => {
+    match guest.tree() {
+        Some(tree) => retained::record(runtime, guest, &tree.borrow(), part),
+        None => {
             let description = guest.render(part)?;
             record(runtime, guest, &description)
         }
-        Protocol::Retained { tree, .. } => retained::record(runtime, guest, &tree.borrow(), part),
     }
 }
 
@@ -783,16 +784,15 @@ pub(super) fn initialize(
         guest.store.borrow_mut().data_mut().view = Some(view.downgrade());
         guest.add_view(view, 0);
     }
-    match &guest.protocol {
-        Protocol::Describe { init, .. } => init
+    match (&guest.protocol, guest.tree()) {
+        (Protocol::Describe { init, .. }, _) => init
             .call(&mut *guest.store.borrow_mut(), ())
             .map_err(|error| anyhow!("guest init failed: {error:#}"))?,
-        Protocol::Retained { init, tree, .. } => {
-            let packed = init
-                .call(&mut *guest.store.borrow_mut(), ())
-                .map_err(|error| anyhow!("guest init failed: {error:#}"))?;
-            let batch = guest.batch(packed)?;
-            tree.borrow_mut().apply(batch)?;
+        (_, tree) => {
+            let batch = guest.retained_init()?;
+            tree.expect("a retained guest has a tree")
+                .borrow_mut()
+                .apply(batch)?;
         }
     }
     // A dialog or panel the guest opened from `init`.
@@ -900,6 +900,31 @@ struct PendingPanel {
     placement: String,
 }
 
+/// A compiled guest: a core module, or a WASI preview 2 component.
+#[derive(Clone)]
+pub(super) enum Program {
+    Module(Module),
+    Component(wasmtime::component::Component),
+}
+
+impl Program {
+    pub(super) fn compile(engine: &wasmtime::Engine, bytes: &[u8]) -> Result<Self> {
+        // A component's header carries layer 1 where a module's carries
+        // version 1 and layer 0.
+        if bytes.get(4..8) == Some(&[0x0d, 0x00, 0x01, 0x00]) {
+            Ok(Self::Component(wasmtime::component::Component::new(
+                engine, bytes,
+            )?))
+        } else {
+            Ok(Self::Module(Module::new(engine, bytes)?))
+        }
+    }
+}
+
+/// The component world's exports (`gpui-shell-wasm-abi/wit/view.wit`).
+type ComponentInit = wasmtime::component::TypedFunc<(), (Vec<u8>,)>;
+type ComponentEvent = wasmtime::component::TypedFunc<(u32, u64, String, String), (Vec<u8>,)>;
+
 /// Which protocol a guest module speaks, by the exports it has.
 enum Protocol {
     /// The guest re-describes a part on every render.
@@ -916,14 +941,22 @@ enum Protocol {
         event: TypedFunc<(u32, u64, u32, u32, u32, u32), u64>,
         tree: RefCell<retained::Tree>,
     },
+    /// The same, for a component: the world's exports, with batches
+    /// returned as values rather than read out of the guest's memory.
+    Component {
+        init: ComponentInit,
+        event: ComponentEvent,
+        tree: RefCell<retained::Tree>,
+    },
 }
 
 /// One instantiated guest module.
 pub(crate) struct Guest {
     store: RefCell<Store<HostState>>,
-    memory: Memory,
+    /// A core module's memory and allocator, through which buffers cross.
+    /// A component has neither to offer: its values cross by the ABI.
+    core: Option<(Memory, TypedFunc<u32, u32>)>,
     protocol: Protocol,
-    alloc: TypedFunc<u32, u32>,
     /// The application generation the guest belongs to; its release stops
     /// what the guest started.
     application: Rc<ApplicationGeneration>,
@@ -953,28 +986,98 @@ struct HostState {
     /// subscription (no host call of its own) can open a scope for it. Weak:
     /// the view owns the guest's lifetime, not the other way round.
     view: Option<WeakEntity<ScriptView>>,
+    /// What a component's WASI imports see: nothing of the machine but
+    /// standard output, until grants are mapped onto it.
+    wasi: wasmtime_wasi::WasiCtx,
+    table: wasmtime_wasi::ResourceTable,
+}
+
+// WASI's linker wants a `Send` store state. A guest and its store never
+// leave the main thread (the synchronous WASI bindings run where they are
+// called), so the `Rc`s here are never touched from another.
+unsafe impl Send for HostState {}
+
+impl wasmtime_wasi::WasiView for HostState {
+    fn ctx(&mut self) -> wasmtime_wasi::WasiCtxView<'_> {
+        wasmtime_wasi::WasiCtxView {
+            ctx: &mut self.wasi,
+            table: &mut self.table,
+        }
+    }
+}
+
+impl HostState {
+    fn new(runtime: &Rc<ShellRuntime>) -> Self {
+        Self {
+            runtime: Rc::downgrade(runtime),
+            guest: Weak::new(),
+            view: None,
+            wasi: wasmtime_wasi::WasiCtxBuilder::new().inherit_stdio().build(),
+            table: wasmtime_wasi::ResourceTable::new(),
+        }
+    }
 }
 
 impl Guest {
-    /// Instantiates `module` for `application` without running its `init`,
+    /// Instantiates `program` for `application` without running its `init`,
     /// which [`initialize`] runs once the guest's view exists.
     pub(super) fn new(
         runtime: &Rc<ShellRuntime>,
-        module: &Module,
+        program: &Program,
         application: Rc<ApplicationGeneration>,
     ) -> Result<Rc<Self>> {
+        let (store, core, protocol) = match program {
+            Program::Module(module) => Self::instantiate_module(runtime, module)?,
+            Program::Component(component) => {
+                let engine = component.engine();
+                let mut linker = wasmtime::component::Linker::new(engine);
+                wasmtime_wasi::p2::add_to_linker_sync(&mut linker)?;
+                link_component_imports(&mut linker)?;
+                let mut store = Store::new(engine, HostState::new(runtime));
+                let instance = linker
+                    .instantiate(&mut store, component)
+                    .context("the component does not fit this host's world")?;
+                let protocol = Protocol::Component {
+                    init: instance.get_typed_func(&mut store, "init")?,
+                    event: instance.get_typed_func(&mut store, "event")?,
+                    tree: RefCell::new(retained::Tree::default()),
+                };
+                (store, None, protocol)
+            }
+        };
+        let guest = Rc::new(Guest {
+            protocol,
+            core,
+            store: RefCell::new(store),
+            application,
+            views: RefCell::new(Vec::new()),
+            nested: RefCell::new(HashMap::new()),
+            pending_dialogs: RefCell::new(Vec::new()),
+            pending_panels: RefCell::new(Vec::new()),
+            pending_sheets: RefCell::new(Vec::new()),
+            docks: RefCell::new(Vec::new()),
+            pending_loads: RefCell::new(Vec::new()),
+            resources: RefCell::new(Vec::new()),
+        });
+        guest.store.borrow_mut().data_mut().guest = Rc::downgrade(&guest);
+        runtime.guests.borrow_mut().push(guest.clone());
+        Ok(guest)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn instantiate_module(
+        runtime: &Rc<ShellRuntime>,
+        module: &Module,
+    ) -> Result<(
+        Store<HostState>,
+        Option<(Memory, TypedFunc<u32, u32>)>,
+        Protocol,
+    )> {
         let engine = module.engine();
         let mut linker = Linker::new(engine);
         link_imports(&mut linker)?;
 
-        let mut store = Store::new(
-            engine,
-            HostState {
-                runtime: Rc::downgrade(runtime),
-                guest: Weak::new(),
-                view: None,
-            },
-        );
+        let mut store = Store::new(engine, HostState::new(runtime));
         let instance: Instance = linker.instantiate(&mut store, module)?;
         let memory = instance
             .get_memory(&mut store, "memory")
@@ -997,24 +1100,44 @@ impl Guest {
                 dispatch: instance.get_typed_func(&mut store, abi::export::DISPATCH)?,
             }
         };
-        let guest = Rc::new(Guest {
-            protocol,
-            alloc: instance.get_typed_func(&mut store, abi::export::ALLOC)?,
-            store: RefCell::new(store),
-            memory,
-            application,
-            views: RefCell::new(Vec::new()),
-            nested: RefCell::new(HashMap::new()),
-            pending_dialogs: RefCell::new(Vec::new()),
-            pending_panels: RefCell::new(Vec::new()),
-            pending_sheets: RefCell::new(Vec::new()),
-            docks: RefCell::new(Vec::new()),
-            pending_loads: RefCell::new(Vec::new()),
-            resources: RefCell::new(Vec::new()),
-        });
-        guest.store.borrow_mut().data_mut().guest = Rc::downgrade(&guest);
-        runtime.guests.borrow_mut().push(guest.clone());
-        Ok(guest)
+        let alloc = instance.get_typed_func(&mut store, abi::export::ALLOC)?;
+        Ok((store, Some((memory, alloc)), protocol))
+    }
+
+    /// The tree a retained guest's operations build.
+    fn tree(&self) -> Option<&RefCell<retained::Tree>> {
+        match &self.protocol {
+            Protocol::Retained { tree, .. } | Protocol::Component { tree, .. } => Some(tree),
+            Protocol::Describe { .. } => None,
+        }
+    }
+
+    fn memory(&self) -> Result<&Memory> {
+        self.core
+            .as_ref()
+            .map(|(memory, _)| memory)
+            .ok_or_else(|| anyhow!("a component's memory is not the host's to read"))
+    }
+
+    /// Runs a retained guest's `init` and returns its first batch.
+    fn retained_init(&self) -> Result<abi::retained::Batch> {
+        match &self.protocol {
+            Protocol::Retained { init, .. } => {
+                let packed = init
+                    .call(&mut *self.store.borrow_mut(), ())
+                    .map_err(|error| anyhow!("guest init failed: {error:#}"))?;
+                self.batch(packed)
+            }
+            Protocol::Component { init, .. } => {
+                let mut store = self.store.borrow_mut();
+                let (bytes,) = init
+                    .call(&mut *store, ())
+                    .map_err(|error| anyhow!("guest init failed: {error:#}"))?;
+                init.post_return(&mut *store)?;
+                postcard::from_bytes(&bytes).context("guest returned a malformed batch")
+            }
+            Protocol::Describe { .. } => anyhow::bail!("not a retained guest"),
+        }
     }
 
     pub(super) fn application(&self) -> Option<Rc<ApplicationGeneration>> {
@@ -1027,34 +1150,50 @@ impl Guest {
 
     /// Reads a batch a retained guest returned.
     fn batch(&self, packed: u64) -> Result<abi::retained::Batch> {
-        let bytes = read(&self.memory, &*self.store.borrow(), packed)?;
+        let bytes = read(self.memory()?, &*self.store.borrow(), packed)?;
         postcard::from_bytes(&bytes).context("guest returned a malformed batch")
     }
 
     /// Copies `bytes` into a buffer the guest allocated; the guest owns it.
     fn give(&self, bytes: &[u8]) -> Result<(u32, u32)> {
+        let (memory, alloc) = self
+            .core
+            .as_ref()
+            .ok_or_else(|| anyhow!("a component takes its arguments by value"))?;
         let mut store = self.store.borrow_mut();
         let len = bytes.len() as u32;
-        let ptr = self.alloc.call(&mut *store, len)?;
-        self.memory.write(&mut *store, ptr as usize, bytes)?;
+        let ptr = alloc.call(&mut *store, len)?;
+        memory.write(&mut *store, ptr as usize, bytes)?;
         Ok((ptr, len))
     }
 
     /// Runs a retained guest's handler and applies the batch it returns,
     /// refreshing the parts it touched.
     fn retained_event(&self, kind: u32, target: u64, name: &str, payload: &[u8]) -> Result<()> {
-        let Protocol::Retained { event, tree, .. } = &self.protocol else {
-            anyhow::bail!("not a retained guest");
+        let batch: abi::retained::Batch = match &self.protocol {
+            Protocol::Retained { event, .. } => {
+                let (name_ptr, name_len) = self.give(name.as_bytes())?;
+                let (payload_ptr, payload_len) = self.give(payload)?;
+                let packed = event
+                    .call(
+                        &mut *self.store.borrow_mut(),
+                        (kind, target, name_ptr, name_len, payload_ptr, payload_len),
+                    )
+                    .map_err(|error| anyhow!("guest handler failed: {error:#}"))?;
+                self.batch(packed)?
+            }
+            Protocol::Component { event, .. } => {
+                let payload = String::from_utf8_lossy(payload).into_owned();
+                let mut store = self.store.borrow_mut();
+                let (bytes,) = event
+                    .call(&mut *store, (kind, target, name.to_owned(), payload))
+                    .map_err(|error| anyhow!("guest handler failed: {error:#}"))?;
+                event.post_return(&mut *store)?;
+                postcard::from_bytes(&bytes).context("guest returned a malformed batch")?
+            }
+            Protocol::Describe { .. } => anyhow::bail!("not a retained guest"),
         };
-        let (name_ptr, name_len) = self.give(name.as_bytes())?;
-        let (payload_ptr, payload_len) = self.give(payload)?;
-        let packed = event
-            .call(
-                &mut *self.store.borrow_mut(),
-                (kind, target, name_ptr, name_len, payload_ptr, payload_len),
-            )
-            .map_err(|error| anyhow!("guest handler failed: {error:#}"))?;
-        let batch = self.batch(packed)?;
+        let tree = self.tree().expect("a retained guest has a tree");
         let parts = tree.borrow_mut().apply(batch)?;
         refresh_guest(self, Some(&parts));
         Ok(())
@@ -1083,7 +1222,7 @@ impl Guest {
         let packed = render
             .call(&mut *store, part)
             .map_err(|error| anyhow!("guest render failed: {error:#}"))?;
-        let bytes = read(&self.memory, &*store, packed)?;
+        let bytes = read(self.memory()?, &*store, packed)?;
         postcard::from_bytes(&bytes).context("guest returned a malformed description")
     }
 
@@ -1096,7 +1235,7 @@ impl Guest {
         let packed = render_items
             .call(&mut *store, (renderer, start, end))
             .map_err(|error| anyhow!("guest item renderer failed: {error:#}"))?;
-        let bytes = read(&self.memory, &*store, packed)?;
+        let bytes = read(self.memory()?, &*store, packed)?;
         postcard::from_bytes(&bytes).context("guest returned malformed items")
     }
 
@@ -1109,7 +1248,7 @@ impl Guest {
         let packed = item_key
             .call(&mut *store, (get_key, index))
             .map_err(|error| anyhow!("guest item key failed: {error:#}"))?;
-        Ok(String::from_utf8(read(&self.memory, &*store, packed)?)?)
+        Ok(String::from_utf8(read(self.memory()?, &*store, packed)?)?)
     }
 
     /// Runs guest handler `callback`. Returns whether it asked to re-render.
@@ -1612,6 +1751,99 @@ fn input_of(runtime: &ShellRuntime, handle: u32) -> Result<Entity<gpui_base::inp
         .ok_or_else(|| anyhow!("input {handle} is not live"))
 }
 
+fn runtime_in(state: &HostState) -> Result<Rc<ShellRuntime>> {
+    state
+        .runtime
+        .upgrade()
+        .ok_or_else(|| anyhow!("the shell runtime is gone"))
+}
+
+fn input_new(state: &HostState, placeholder: String) -> Result<u32> {
+    let runtime = runtime_in(state)?;
+    let handle = scope::with_current(|window, cx| {
+        runtime.entities().create_input(
+            (!placeholder.is_empty()).then_some(placeholder),
+            None,
+            scope::current_application_generation(),
+            window,
+            cx,
+        )
+    })
+    .ok_or_else(|| anyhow!("input_new needs a live host call; call it from init"))?
+    .map_err(|_| anyhow!("too many retained entities"))?;
+    u32::try_from(handle).context("input handle does not fit the guest ABI")
+}
+
+fn input_value(state: &HostState, handle: u32) -> Result<String> {
+    let runtime = runtime_in(state)?;
+    let input = input_of(&runtime, handle)?;
+    scope::with_current_app(|cx| input.read(cx).value().to_string())
+        .ok_or_else(|| anyhow!("input_value needs a live host call"))
+}
+
+fn input_set_value(state: &HostState, handle: u32, text: String) -> Result<()> {
+    let runtime = runtime_in(state)?;
+    let input = input_of(&runtime, handle)?;
+    scope::with_current(|window, cx| {
+        input.update(cx, |input, cx| input.set_value(text, window, cx))
+    })
+    .ok_or_else(|| anyhow!("input_set_value needs a live host call"))
+}
+
+fn input_on_submit(state: &HostState, handle: u32, callback: u32) -> Result<()> {
+    let runtime = runtime_in(state)?;
+    let guest = state.guest.clone();
+    let subscribed = scope::with_current(|window, cx| {
+        runtime.entities().subscribe_input(
+            EntityHandle::from(handle),
+            InputEventName::Submit,
+            window,
+            cx,
+            move |_event, window, app| {
+                if let Some(guest) = guest.upgrade() {
+                    guest.dispatch_native(callback, window, app);
+                }
+            },
+        )
+    })
+    .ok_or_else(|| anyhow!("input_on_submit needs a live host call"))?;
+    anyhow::ensure!(subscribed, "input {handle} is not live");
+    Ok(())
+}
+
+/// The component world's `host` interface
+/// (`gpui-shell-wasm-abi/wit/view.wit`). Its version is in the name, so a
+/// guest built against another one fails to instantiate.
+fn link_component_imports(linker: &mut wasmtime::component::Linker<HostState>) -> Result<()> {
+    use wasmtime::StoreContextMut;
+    let mut host = linker.instance("gpui-shell:guest/host@0.1.0")?;
+    host.func_wrap(
+        "input-new",
+        |store: StoreContextMut<'_, HostState>, (placeholder,): (String,)| {
+            Ok((input_new(store.data(), placeholder)?,))
+        },
+    )?;
+    host.func_wrap(
+        "input-value",
+        |store: StoreContextMut<'_, HostState>, (handle,): (u32,)| {
+            Ok((input_value(store.data(), handle)?,))
+        },
+    )?;
+    host.func_wrap(
+        "input-set-value",
+        |store: StoreContextMut<'_, HostState>, (handle, value): (u32, String)| {
+            input_set_value(store.data(), handle, value)
+        },
+    )?;
+    host.func_wrap(
+        "input-on-submit",
+        |store: StoreContextMut<'_, HostState>, (handle, callback): (u32, u32)| {
+            input_on_submit(store.data(), handle, callback)
+        },
+    )?;
+    Ok(())
+}
+
 fn link_imports(linker: &mut Linker<HostState>) -> Result<()> {
     let module = abi::IMPORT_MODULE;
     linker.func_wrap(
@@ -1619,29 +1851,14 @@ fn link_imports(linker: &mut Linker<HostState>) -> Result<()> {
         abi::import::INPUT_NEW,
         |mut caller: Caller<'_, HostState>, ptr: u32, len: u32| -> Result<u32> {
             let placeholder = read_string(&mut caller, ptr, len)?;
-            let runtime = runtime_of(&caller)?;
-            let handle = scope::with_current(|window, cx| {
-                runtime.entities().create_input(
-                    (!placeholder.is_empty()).then_some(placeholder),
-                    None,
-                    scope::current_application_generation(),
-                    window,
-                    cx,
-                )
-            })
-            .ok_or_else(|| anyhow!("input_new needs a live host call; call it from init"))?
-            .map_err(|_| anyhow!("too many retained entities"))?;
-            u32::try_from(handle).context("input handle does not fit the guest ABI")
+            input_new(caller.data(), placeholder)
         },
     )?;
     linker.func_wrap(
         module,
         abi::import::INPUT_VALUE,
         |mut caller: Caller<'_, HostState>, handle: u32| -> Result<u64> {
-            let runtime = runtime_of(&caller)?;
-            let state = input_of(&runtime, handle)?;
-            let text = scope::with_current_app(|cx| state.read(cx).value().to_string())
-                .ok_or_else(|| anyhow!("input_value needs a live host call"))?;
+            let text = input_value(caller.data(), handle)?;
             write_string(&mut caller, &text)
         },
     )?;
@@ -1650,36 +1867,14 @@ fn link_imports(linker: &mut Linker<HostState>) -> Result<()> {
         abi::import::INPUT_SET_VALUE,
         |mut caller: Caller<'_, HostState>, handle: u32, ptr: u32, len: u32| -> Result<()> {
             let text = read_string(&mut caller, ptr, len)?;
-            let runtime = runtime_of(&caller)?;
-            let state = input_of(&runtime, handle)?;
-            scope::with_current(|window, cx| {
-                state.update(cx, |state, cx| state.set_value(text, window, cx))
-            })
-            .ok_or_else(|| anyhow!("input_set_value needs a live host call"))
+            input_set_value(caller.data(), handle, text)
         },
     )?;
     linker.func_wrap(
         module,
         abi::import::INPUT_ON_SUBMIT,
         |caller: Caller<'_, HostState>, handle: u32, callback: u32| -> Result<()> {
-            let runtime = runtime_of(&caller)?;
-            let guest = caller.data().guest.clone();
-            let subscribed = scope::with_current(|window, cx| {
-                runtime.entities().subscribe_input(
-                    EntityHandle::from(handle),
-                    InputEventName::Submit,
-                    window,
-                    cx,
-                    move |_event, window, app| {
-                        if let Some(guest) = guest.upgrade() {
-                            guest.dispatch_native(callback, window, app);
-                        }
-                    },
-                )
-            })
-            .ok_or_else(|| anyhow!("input_on_submit needs a live host call"))?;
-            anyhow::ensure!(subscribed, "input {handle} is not live");
-            Ok(())
+            input_on_submit(caller.data(), handle, callback)
         },
     )?;
     linker.func_wrap(
@@ -2496,11 +2691,17 @@ mod tests {
     /// it rather than reading a checked-in binary, so the guest and the host it
     /// is tested against cannot drift apart.
     fn build_guest(example: &str) -> PathBuf {
+        build_guest_for(example, "wasm32-unknown-unknown")
+    }
+
+    /// The example built for `target`: a core module, or for
+    /// `wasm32-wasip2` a component.
+    fn build_guest_for(example: &str, target: &str) -> PathBuf {
         let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../examples")
             .join(example);
         let status = Command::new(env!("CARGO"))
-            .args(["build", "--release", "--target", "wasm32-unknown-unknown"])
+            .args(["build", "--release", "--target", target])
             .arg("--manifest-path")
             .arg(directory.join("Cargo.toml"))
             .status()
@@ -2510,13 +2711,19 @@ mod tests {
             "the example guest {example} failed to build"
         );
         directory
-            .join("target/wasm32-unknown-unknown/release")
+            .join("target")
+            .join(target)
+            .join("release")
             .join(format!("{example}.wasm"))
     }
 
     /// An application directory holding example `example`'s guest and a
     /// manifest naming it as the entry.
     fn application(example: &str) -> PathBuf {
+        application_for(example, "wasm32-unknown-unknown")
+    }
+
+    fn application_for(example: &str, target: &str) -> PathBuf {
         let directory = std::env::temp_dir().join(format!(
             "gpui-shell-{example}-{}-{}",
             std::process::id(),
@@ -2526,7 +2733,11 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&directory).unwrap();
-        std::fs::copy(build_guest(example), directory.join("guest.wasm")).unwrap();
+        std::fs::copy(
+            build_guest_for(example, target),
+            directory.join("guest.wasm"),
+        )
+        .unwrap();
         std::fs::write(
             directory.join(MANIFEST_FILE),
             format!(
@@ -2550,7 +2761,11 @@ mod tests {
         }
 
         fn load_example(cx: &mut TestAppContext, example: &str) -> Self {
-            let directory = application(example);
+            Self::load_example_for(cx, example, "wasm32-unknown-unknown")
+        }
+
+        fn load_example_for(cx: &mut TestAppContext, example: &str, target: &str) -> Self {
+            let directory = application_for(example, target);
             // The runtime the shipped command builds: with the catalog.
             let components = crate::components::components().expect("catalog");
             cx.update(|cx| crate::init_with_components(cx, &components));
@@ -2720,6 +2935,17 @@ mod tests {
     #[gpui::test]
     fn the_todo_guest_with_child_view_rows_does_the_same(cx: &mut TestAppContext) {
         todo_flow(Harness::load_example(cx, "wasm_todolist_children"));
+    }
+
+    /// And for the same guest built as a WASI preview 2 component, whose
+    /// boundary is the WIT world rather than raw imports and exports.
+    #[gpui::test]
+    fn the_todo_guest_as_a_wasi_component_does_the_same(cx: &mut TestAppContext) {
+        todo_flow(Harness::load_example_for(
+            cx,
+            "wasm_todolist_children",
+            "wasm32-wasip2",
+        ));
     }
 
     fn todo_flow(mut app: Harness) {

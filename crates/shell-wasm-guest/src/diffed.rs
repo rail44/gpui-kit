@@ -42,7 +42,7 @@ use std::{
 use crate::{
     CArg, Cx, Element, Event, Kind as ElementKind, PendingOp,
     abi::{
-        self, Component, Name, Op,
+        Component, Name, Op,
         retained::{Kind, Mutation, Prop},
     },
     plain_argument,
@@ -750,10 +750,4 @@ fn prop(op: Op) -> (Name, Prop) {
         Op::Component(name, args) => (name.clone(), Prop::Component(name, args)),
         other => panic!("a retained view written as a GPUI view cannot use {other:?} yet"),
     }
-}
-
-/// Encodes a batch for the host, keeping the buffer alive until the next.
-pub fn pack(batch: &[Mutation], last: &mut Vec<u8>) -> u64 {
-    *last = postcard::to_allocvec(batch).expect("a batch encodes");
-    abi::pack(last.as_ptr() as u32, last.len() as u32)
 }

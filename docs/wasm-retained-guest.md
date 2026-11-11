@@ -274,6 +274,29 @@ host's copy of the whole part into the arena (the describe row), which a
 child view does not yet narrow: for that, a child view has to be a view of
 its own on the host too.
 
+### As a WASI preview 2 component
+
+A guest built for `wasm32-wasip2` is a component, and its boundary is the
+WIT world in `crates/shell-wasm-abi/wit/view.wit` instead of raw imports
+and exports: `init` and `event` as exports, the host's own functions as a
+`host` interface, WASI for what WASI covers (files, clocks, standard
+output come from the guest's standard library). The package version in the
+world is the boundary's version, so a guest built against another one fails
+to instantiate. Batches still cross as postcard bytes, because props and
+component arguments nest and WIT types cannot.
+
+`export_view_retained!` builds either kind from the same view code. The
+todo list with child rows, built as a component, passes the same test, and
+in the comparison a toggled row costs the same as the core module
+(0.022 / 0.032 ms against 0.023 / 0.032 ms; three runs).
+
+So far the world carries only what that example needs: the input
+functions. Everything else the SDK offers a core module (storage, HTTP,
+processes, sockets, parts, docks) is not in the world yet and traps in a
+component; the reactive SDK's exports are not built for components yet;
+and a component's WASI context grants nothing but standard output until
+the manifest's file grants are mapped onto preopened directories.
+
 Simplified or not yet done:
 
 - Events from retained state and resources arrive as `HANDLER` events

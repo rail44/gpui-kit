@@ -33,6 +33,7 @@ default = ["quickjs", "components", "webview"]
 wasm-engine = [
     "components",
     "dep:wasmtime",
+    "dep:wasmtime-wasi",
     "dep:gpui-shell-wasm-abi",
     "dep:postcard",
     "dep:reqwest",
@@ -61,7 +62,10 @@ quickjs = [
 [dependencies]
 gpui-shell-wasm-abi = { path = "../shell-wasm-abi", optional = true }
 postcard = { version = "1.1", default-features = false, features = ["alloc"], optional = true }
-wasmtime = { version = "36", default-features = false, features = ["runtime", "cranelift", "std"], optional = true }
+wasmtime = { version = "36", default-features = false, features = ["runtime", "cranelift", "std", "component-model"], optional = true }
+# WASI for guests built as preview 2 components: files, clocks and standard
+# output are the guest's standard library's, not imports of our own.
+wasmtime-wasi = { version = "36", default-features = false, optional = true }
 gpui.workspace = true
 gpui-fast = { workspace = true, optional = true }
 gpui_platform.workspace = true

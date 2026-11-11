@@ -49,7 +49,7 @@ pub(crate) use guest::Guest;
 /// A compiled application module, ready to instantiate.
 #[derive(Clone)]
 pub struct ViewType {
-    module: wasmtime::Module,
+    module: guest::Program,
     application: Rc<ApplicationGeneration>,
 }
 
@@ -465,7 +465,7 @@ impl ShellRuntime {
         );
         let bytes =
             std::fs::read(&path).with_context(|| format!("cannot read {}", path.display()))?;
-        let module = wasmtime::Module::new(&self.engine, &bytes)
+        let module = guest::Program::compile(&self.engine, &bytes)
             .with_context(|| format!("{} is not a WebAssembly module", path.display()))?;
         let application = ApplicationGeneration::new(self.next_application_generation.get());
         self.next_application_generation.set(

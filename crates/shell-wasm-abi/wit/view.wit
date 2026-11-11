@@ -1,0 +1,32 @@
+/// The boundary between gpui-shell and a guest view built as a WASI
+/// preview 2 component (`docs/wasm-retained-guest.md`).
+///
+/// The package version is the boundary's version: a host refuses a guest
+/// built against another one when it instantiates it.
+package gpui-shell:guest@0.1.0;
+
+/// What a guest reaches in the host beyond WASI. Files, clocks and standard
+/// output are WASI's; this is what WASI has no word for.
+interface host {
+    /// Creates a retained text input and returns its handle. From `init` or
+    /// a handler.
+    input-new: func(placeholder: string) -> u32;
+    input-value: func(handle: u32) -> string;
+    input-set-value: func(handle: u32, value: string);
+    /// Delivers Enter in the input as a `handler` event addressed to
+    /// `callback`.
+    input-on-submit: func(handle: u32, callback: u32);
+}
+
+world view {
+    import host;
+
+    /// Builds the view and returns its first batch: a postcard-encoded
+    /// `retained::Batch`. Encoded rather than typed here because props and
+    /// component arguments nest, which WIT types cannot.
+    export init: func() -> list<u8>;
+
+    /// Runs the handler `kind`/`target` name with the JSON `payload`, and
+    /// returns the batch it produced. `kind` is `retained::target`'s.
+    export event: func(kind: u32, target: u64, name: string, payload: string) -> list<u8>;
+}

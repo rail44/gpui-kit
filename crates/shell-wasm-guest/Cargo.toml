@@ -12,3 +12,8 @@ postcard = { version = "1.1", default-features = false, features = ["alloc"] }
 # The reactive graph under `reactive`: synchronous effects and no imports
 # (docs/wasm-retained-guest.md).
 sycamore-reactive = "0.9.4"
+
+# A guest built for `wasm32-wasip2` is a component, whose boundary is the
+# WIT world in `gpui-shell-wasm-abi/wit`.
+[target.'cfg(target_env = "p2")'.dependencies]
+wit-bindgen = "0.63"

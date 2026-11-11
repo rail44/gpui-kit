@@ -52,27 +52,30 @@ fn example(name: &str) -> PathBuf {
 
 /// The application directory and entry this engine runs for `example`.
 #[cfg(feature = "quickjs")]
-fn application(example_name: &str) -> (PathBuf, &'static str) {
+fn application(example_name: &str, target: &str) -> (PathBuf, &'static str) {
+    let _ = target;
     (example(example_name).join("app-js"), "main.js")
 }
 
 /// The application directory and entry this engine runs for `example`: the
 /// guest, built now so it cannot drift from the host it is timed on.
 #[cfg(feature = "wasm-engine")]
-fn application(example_name: &str) -> (PathBuf, &'static str) {
+fn application(example_name: &str, target: &str) -> (PathBuf, &'static str) {
     let directory = example(example_name);
     let status = std::process::Command::new(env!("CARGO"))
-        .args(["build", "--release", "--target", "wasm32-unknown-unknown"])
+        .args(["build", "--release", "--target", target])
         .arg("--manifest-path")
         .arg(directory.join("Cargo.toml"))
         .status()
         .expect("run cargo for the guest");
     assert!(status.success(), "the guest {example_name} failed to build");
     let module = directory
-        .join("target/wasm32-unknown-unknown/release")
+        .join("target")
+        .join(target)
+        .join("release")
         .join(format!("{example_name}.wasm"));
     let target = std::env::temp_dir().join(format!(
-        "gpui-shell-comparison-{example_name}-{}",
+        "gpui-shell-comparison-{example_name}-{target}-{}",
         std::process::id()
     ));
     std::fs::create_dir_all(&target).unwrap();
@@ -86,7 +89,11 @@ struct Loaded {
     view: Entity<ScriptView>,
 }
 
-fn load(cx: &mut TestAppContext, example_name: &str) -> Loaded {
+/// The target a guest is built for unless a case says otherwise: a core
+/// module.
+const CORE: &str = "wasm32-unknown-unknown";
+
+fn load(cx: &mut TestAppContext, example_name: &str, target: &str) -> Loaded {
     let components = crate::components::components().expect("catalog");
     cx.update(|cx| crate::init_with_components(cx, &components));
     let runtime = ShellRuntime::new_isolated_with_components(components).expect("runtime");
@@ -95,7 +102,7 @@ fn load(cx: &mut TestAppContext, example_name: &str) -> Loaded {
     cx.update(|cx| runtime.set_global(cx));
     let window = cx.add_window(|_, _| gpui::Empty);
     let mut context = VisualTestContext::from_window(*window.deref(), cx);
-    let (directory, entry) = application(example_name);
+    let (directory, entry) = application(example_name, target);
     let view_type = runtime.load_app(&directory, entry).expect("load");
     let view = context
         .update(|window, cx| runtime.instantiate_view(&view_type, window, cx))
@@ -204,7 +211,7 @@ fn report(
 
 #[gpui::test]
 fn the_grid_is_timed(cx: &mut TestAppContext) {
-    let mut app = load(cx, "wasm_grid");
+    let mut app = load(cx, "wasm_grid", CORE);
     let snapshot = app.snapshot();
     let describe = app.describe();
     let materialize = app.materialize(&snapshot);
@@ -218,7 +225,7 @@ fn the_grid_is_timed(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn the_todo_list_is_timed(cx: &mut TestAppContext) {
-    time_todo(cx, "wasm_todolist", ENGINE);
+    time_todo(cx, "wasm_todolist", CORE, ENGINE);
 }
 
 /// The same todo list written as a GPUI view is (a `render` after every
@@ -227,18 +234,31 @@ fn the_todo_list_is_timed(cx: &mut TestAppContext) {
 #[cfg(feature = "wasm-engine")]
 #[gpui::test]
 fn the_todo_list_written_as_a_gpui_view_is_timed(cx: &mut TestAppContext) {
-    time_todo(cx, "wasm_todolist_render", "wasm-render");
+    time_todo(cx, "wasm_todolist_render", CORE, "wasm-render");
 }
 
 /// And with each row a child view, which renders again alone.
 #[cfg(feature = "wasm-engine")]
 #[gpui::test]
 fn the_todo_list_with_child_view_rows_is_timed(cx: &mut TestAppContext) {
-    time_todo(cx, "wasm_todolist_children", "wasm-children");
+    time_todo(cx, "wasm_todolist_children", CORE, "wasm-children");
 }
 
-fn time_todo(cx: &mut TestAppContext, example_name: &str, engine: &str) {
-    let mut app = load(cx, example_name);
+/// The same guest built as a WASI preview 2 component: what the component
+/// boundary costs beside the raw one.
+#[cfg(feature = "wasm-engine")]
+#[gpui::test]
+fn the_todo_list_as_a_wasi_component_is_timed(cx: &mut TestAppContext) {
+    time_todo(
+        cx,
+        "wasm_todolist_children",
+        "wasm32-wasip2",
+        "wasm-component",
+    );
+}
+
+fn time_todo(cx: &mut TestAppContext, example_name: &str, target: &str, engine: &str) {
+    let mut app = load(cx, example_name, target);
 
     // Rows go in the way a person adds them: type, then press Add.
     for row in 0..TODO_ROWS {
