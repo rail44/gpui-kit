@@ -1,0 +1,21 @@
+[package]
+name = "wasm-todolist-children"
+description = "Spike: the wasm_todolist view written as a GPUI view whose rows are child views."
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Built for `wasm32-unknown-unknown` on its own, outside the gpui-kit
+# workspace, so a workspace build never tries to link a guest for the host.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+gpui-shell-wasm-guest = { path = "../../crates/shell-wasm-guest" }
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true

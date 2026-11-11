@@ -230,6 +230,13 @@ fn the_todo_list_written_as_a_gpui_view_is_timed(cx: &mut TestAppContext) {
     time_todo(cx, "wasm_todolist_render", "wasm-render");
 }
 
+/// And with each row a child view, which renders again alone.
+#[cfg(feature = "wasm-engine")]
+#[gpui::test]
+fn the_todo_list_with_child_view_rows_is_timed(cx: &mut TestAppContext) {
+    time_todo(cx, "wasm_todolist_children", "wasm-children");
+}
+
 fn time_todo(cx: &mut TestAppContext, example_name: &str, engine: &str) {
     let mut app = load(cx, example_name);
 

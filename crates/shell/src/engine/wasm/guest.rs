@@ -2716,6 +2716,12 @@ mod tests {
         todo_flow(Harness::load_example(cx, "wasm_todolist_render"));
     }
 
+    /// And for the one whose rows are child views.
+    #[gpui::test]
+    fn the_todo_guest_with_child_view_rows_does_the_same(cx: &mut TestAppContext) {
+        todo_flow(Harness::load_example(cx, "wasm_todolist_children"));
+    }
+
     fn todo_flow(mut app: Harness) {
         let tree = app.tree();
         assert!(tree.contains("Nothing yet"), "{tree}");

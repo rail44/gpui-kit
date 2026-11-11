@@ -244,9 +244,35 @@ values instead of flattening and copying them, compares props in order
 first, and touches the handler table only where a callback moved; and a
 style, method or event name, or a string argument, is an
 `abi::Name` (`Cow<'static, str>`), so a literal in the view's code is never
-copied. The next step is GPUI's own one: child views that render again
-only when notified, which the script engine already has (`cx.new(Class)`,
-`cx.notify(entity)`).
+copied.
+
+### With rows as child views
+
+`examples/wasm_todolist_children` splits the same view the way a GPUI view
+is split into entities: each row is a child view (`cx.new`, kept in the
+list's state and placed from its `render`) that holds its own todo. A row
+renders again only when it notified; the list, when it renders again,
+keeps every row it still places without rendering it. A row tells the list
+with `cx.emit`, heard through `cx.subscribe`. The script engine has the
+same thing (`cx.new(Class)`, `cx.notify(entity)`); its todo twin does not
+use it. It passes the same todo test, with the same tree.
+
+Five alternating release runs, load average about 3.9 (best / median, ms):
+
+| | QuickJS | reactive | GPUI style | GPUI style, child rows |
+|---|---|---|---|---|
+| describe | 0.895 / 0.977 | 0.157 / 0.240 | 0.166 / 0.175 | 0.159 / 0.216 |
+| filter click | 0.005 / 0.006 | 0.011 / 0.016 | 0.285 / 0.294 | 0.019 / 0.023 |
+| one row toggled | 0.005 / 0.005 | 0.058 / 0.086 | 0.276 / 0.293 | 0.022 / 0.029 |
+
+Ticking a row now renders that row and the list's own frame (its header,
+and a hundred places that are kept), instead of a hundred rows: 0.02 to
+0.03 ms in the guest, under the reactive guest's 0.06 to 0.09 ms, whose
+every row re-reads the list to find its own todo. Per toggled row to a
+description, about 0.25 ms against QuickJS's 0.98 ms. What is left is the
+host's copy of the whole part into the arena (the describe row), which a
+child view does not yet narrow: for that, a child view has to be a view of
+its own on the host too.
 
 Simplified or not yet done:
 

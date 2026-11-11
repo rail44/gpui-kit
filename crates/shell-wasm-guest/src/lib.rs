@@ -39,8 +39,9 @@ pub mod reactive;
 pub mod prelude {
     pub use crate::{
         CArg, ComponentState, Cx, Data, Dock, Element, Event, Handler, InputState, Part,
-        ToastLevel, View, button, checkbox, component, div, dock, export_view, h_flex, input,
-        nested, text, v_flex,
+        ToastLevel, View, button, checkbox, component,
+        diffed::{Child, Render},
+        div, dock, export_view, h_flex, input, nested, text, v_flex,
     };
 }
 
@@ -90,6 +91,11 @@ pub struct Cx<V> {
     item_keys: Vec<Vec<ItemKey<V>>>,
     rendering: Option<u32>,
     notify: bool,
+    /// Which view this is: 0 for the guest's own, a child view's key
+    /// otherwise ([`diffed::Child`]).
+    owner: u32,
+    /// What this view does when a child view it subscribed to emits.
+    subscriptions: Vec<(u32, diffed::Subscriber<V>)>,
 }
 
 /// A registered handler, ready to pass to [`Element::on_click`] and friends.
@@ -112,7 +118,7 @@ pub enum ToastLevel {
 }
 
 impl<V: 'static> Cx<V> {
-    fn new() -> Self {
+    fn fresh() -> Self {
         Self {
             per_render: vec![Vec::new()],
             persistent: Vec::new(),
@@ -121,7 +127,21 @@ impl<V: 'static> Cx<V> {
             item_keys: vec![Vec::new()],
             rendering: None,
             notify: false,
+            owner: 0,
+            subscriptions: Vec::new(),
         }
+    }
+
+    /// The handler a callback id names, if it is still registered.
+    fn handler(&self, callback: u32) -> Option<Callback<V>> {
+        if callback & PERSISTENT != 0 {
+            self.persistent.get((callback & !PERSISTENT) as usize)
+        } else {
+            self.per_render
+                .get((callback >> PART_SHIFT) as usize)
+                .and_then(|handlers| handlers.get((callback & INDEX_MASK) as usize))
+        }
+        .cloned()
     }
 
     /// Wraps a handler that gets the view mutably, the way GPUI's
@@ -280,7 +300,12 @@ pub struct Element {
 
 enum Kind {
     Base(Component),
-    Registered { export: String, args: Vec<CArg> },
+    Registered {
+        export: String,
+        args: Vec<CArg>,
+    },
+    /// A child view, drawn where the element is placed.
+    Child(Rc<dyn diffed::ChildDyn>),
 }
 
 enum PendingOp {
@@ -631,8 +656,8 @@ impl Element {
         self
     }
 
-    pub fn child(mut self, child: Element) -> Self {
-        self.children.push(child);
+    pub fn child(mut self, child: impl Into<Element>) -> Self {
+        self.children.push(child.into());
         self
     }
     pub fn children(mut self, children: impl IntoIterator<Item = Element>) -> Self {
@@ -674,6 +699,9 @@ impl Element {
         fn flatten(element: Element, nodes: &mut Vec<Node>) -> u32 {
             let component = match element.kind {
                 Kind::Base(component) => component,
+                Kind::Child(_) => {
+                    panic!("child views need `export_view_retained!`")
+                }
                 Kind::Registered { export, args } => Component::Registered {
                     export,
                     args: args.into_iter().map(|arg| argument(arg, nodes)).collect(),
@@ -1210,7 +1238,7 @@ impl<V: View> Default for Guest<V> {
     fn default() -> Self {
         Self {
             view: None,
-            cx: Cx::new(),
+            cx: Cx::fresh(),
             last: Vec::new(),
             differ: diffed::Differ::default(),
             last_items: Vec::new(),
@@ -1257,21 +1285,50 @@ impl<V: View> Guest<V> {
     /// protocol.
     pub fn retained_init(&mut self) -> u64 {
         self.init();
-        self.retained_render()
+        self.retained_render(true)
     }
 
-    /// Renders the view, compares it with the last render and returns the
-    /// operations between them.
-    fn retained_render(&mut self) -> u64 {
-        if let Some(element) = self.element(0) {
+    /// Renders the view if `root` asks for it, then every child view that
+    /// notified, and returns the operations that came of it.
+    fn retained_render(&mut self, root: bool) -> u64 {
+        if root && let Some(element) = self.element(0) {
             self.differ.update(element);
         }
+        self.differ.refresh_children();
         let batch = self.differ.take();
         diffed::pack(&batch, &mut self.last)
     }
 
-    /// Runs the handler an event is addressed to, renders again if it
-    /// notified, and returns the batch.
+    /// Hands what child views emitted to the view's subscriptions, until
+    /// nothing more is emitted.
+    fn deliver_emitted(&mut self) {
+        loop {
+            let emitted = diffed::take_emitted();
+            if emitted.is_empty() {
+                return;
+            }
+            self.cx
+                .subscriptions
+                .retain(|(child, _)| diffed::is_alive(*child));
+            for (child, event) in emitted {
+                let subscribers: Vec<_> = self
+                    .cx
+                    .subscriptions
+                    .iter()
+                    .filter(|(subscribed, _)| *subscribed == child)
+                    .map(|(_, subscriber)| subscriber.clone())
+                    .collect();
+                if let Some(view) = self.view.as_mut() {
+                    for subscriber in subscribers {
+                        subscriber(view, event.as_ref(), &mut self.cx);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Runs the handler an event is addressed to, in the view or the child
+    /// view that registered it, renders what notified, and returns the batch.
     pub fn retained_event(
         &mut self,
         kind: u32,
@@ -1279,21 +1336,24 @@ impl<V: View> Guest<V> {
         name: Vec<u8>,
         payload: Vec<u8>,
     ) -> u64 {
-        let callback = match kind {
+        let handler = match kind {
             abi::retained::target::NODE => {
                 let name = String::from_utf8(name).unwrap_or_default();
                 self.differ.handler(target, &name)
             }
-            abi::retained::target::HANDLER => Some(target as u32),
+            abi::retained::target::HANDLER => Some((0, target as u32)),
             _ => None,
         };
-        let notify = callback.is_some_and(|callback| self.dispatch(callback, payload) != 0);
-        if notify {
-            self.retained_render()
-        } else {
-            let batch = self.differ.take();
-            diffed::pack(&batch, &mut self.last)
+        let mut notify = false;
+        match handler {
+            Some((0, callback)) => notify = self.dispatch(callback, payload) != 0,
+            Some((child, callback)) => diffed::dispatch_child(child, callback, payload),
+            None => {}
         }
+        self.cx.notify = false;
+        self.deliver_emitted();
+        notify |= std::mem::take(&mut self.cx.notify);
+        self.retained_render(notify)
     }
 
     /// Describes items `start..end` of a list, during the host's layout. The
@@ -1336,15 +1396,7 @@ impl<V: View> Guest<V> {
 
     pub fn dispatch(&mut self, callback: u32, payload: Vec<u8>) -> u32 {
         let event = Event(serde_json::from_slice(&payload).unwrap_or(Value::Null));
-        let handler = if callback & PERSISTENT != 0 {
-            self.cx.persistent.get((callback & !PERSISTENT) as usize)
-        } else {
-            self.cx
-                .per_render
-                .get((callback >> PART_SHIFT) as usize)
-                .and_then(|handlers| handlers.get((callback & INDEX_MASK) as usize))
-        }
-        .cloned();
+        let handler = self.cx.handler(callback);
         let (Some(handler), Some(view)) = (handler, self.view.as_mut()) else {
             return 0;
         };
